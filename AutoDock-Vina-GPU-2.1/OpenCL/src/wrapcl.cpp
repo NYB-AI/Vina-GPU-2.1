@@ -144,26 +144,52 @@ void SetupPlatform(cl_platform_id** platforms, cl_int* gpu_platform) {
     *platforms = (cl_platform_id*)malloc(sizeof(cl_platform_id) * (num_platform));
     err = clGetPlatformIDs(num_platform, *platforms, NULL); checkErr(err);
 #ifdef NVIDIA_PLATFORM
+        int best_platform = -1;
+        cl_uint max_devices = 0;
+        
         for (int i = 0; i < num_platform; i++) {
             err = clGetPlatformInfo((*platforms)[i], CL_PLATFORM_NAME, 0, NULL, &size); checkErr(err);
             char* platform_name = (char*)malloc(sizeof(char) * size);
             err = clGetPlatformInfo((*platforms)[i], CL_PLATFORM_NAME, size, platform_name, NULL); checkErr(err);
             std::string tmp = platform_name;
+            
             if (tmp.find(nvidia) != std::string::npos) {
-                *gpu_platform = i;
-                printf("GPU Platform: %s", platform_name);fflush(stdout);
-#ifdef DISPLAY_ADDITION_INFO
-                err = clGetPlatformInfo((*platforms)[i], CL_PLATFORM_VERSION, 0, NULL, &size); checkErr(err);
-                char* platform_version = (char*)malloc(sizeof(char) * size);
-                err = clGetPlatformInfo((*platforms)[i], CL_PLATFORM_VERSION, size, platform_version, NULL); checkErr(err);
-                printf("GPU Platform %d version: %s\n", i, platform_version);
-                free(platform_version);
-#endif
-                break;
+                // Count how many devices this platform has
+                cl_uint num_devices = 0;
+                err = clGetDeviceIDs((*platforms)[i], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices);
+                
+                if (err == CL_DEVICE_NOT_FOUND) {
+                    free(platform_name);
+                    continue; // No devices on this platform
+                }
+                
+                checkErr(err);
+                
+                // If this platform has more devices, select it
+                if (num_devices > max_devices) {
+                    max_devices = num_devices;
+                    best_platform = i;
+                }
+                
+                // Print platform info
+                printf("\nFound NVIDIA Platform %d: %s with %d device(s)", i, platform_name, num_devices);
             }
+            
+            free(platform_name);
         }
-        if(*gpu_platform==-1){
-            printf("Cannot find any NVIDIA platform\n");fflush(stdout);
+        
+        if (best_platform != -1) {
+            *gpu_platform = best_platform;
+            
+            // Print the selected platform name
+            err = clGetPlatformInfo((*platforms)[best_platform], CL_PLATFORM_NAME, 0, NULL, &size); checkErr(err);
+            char* platform_name = (char*)malloc(sizeof(char) * size);
+            err = clGetPlatformInfo((*platforms)[best_platform], CL_PLATFORM_NAME, size, platform_name, NULL); checkErr(err);
+            
+            printf("\nSelected GPU Platform %d: %s with %d device(s)", best_platform, platform_name, max_devices);
+            free(platform_name);
+        } else {
+            printf("\nCannot find any NVIDIA platform\n");fflush(stdout);
             exit(-1);
         }
 #elif AMD_PLATFORM
@@ -281,7 +307,59 @@ void SetupDevice(cl_platform_id* platforms, cl_device_id** devices, cl_int gpu_p
     size_t device_name_size;
     cl_ulong mem_size;
     cl_int N = gpu_platform;
-    //Initiate device info on number N platform
+    
+    // Run a diagnostic on all platforms to check for GPUs
+    cl_uint num_platform;
+    err = clGetPlatformIDs(0, NULL, &num_platform); checkErr(err);
+    
+    printf("\n*** NVIDIA GPU DIAGNOSTIC ***");
+    int total_gpus = 0;
+    
+    for (cl_uint i = 0; i < num_platform; i++) {
+        size_t platform_name_size;
+        err = clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, 0, NULL, &platform_name_size); checkErr(err);
+        char* platform_name = (char*)malloc(sizeof(char) * platform_name_size);
+        err = clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, platform_name_size, platform_name, NULL); checkErr(err);
+        
+        cl_uint plat_num_devices = 0;
+        err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 0, NULL, &plat_num_devices);
+        
+        if (err == CL_DEVICE_NOT_FOUND) {
+            printf("\nPlatform %d: %s - No GPU devices", i, platform_name);
+            free(platform_name);
+            continue;
+        }
+        
+        checkErr(err);
+        
+        cl_device_id* plat_devices = (cl_device_id*)malloc(sizeof(cl_device_id) * plat_num_devices);
+        err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, plat_num_devices, plat_devices, NULL); checkErr(err);
+        
+        printf("\nPlatform %d: %s - %d GPU device(s)", i, platform_name, plat_num_devices);
+        
+        for (cl_uint j = 0; j < plat_num_devices; j++) {
+            size_t device_name_len;
+            err = clGetDeviceInfo(plat_devices[j], CL_DEVICE_NAME, 0, NULL, &device_name_len); checkErr(err);
+            char* plat_device_name = (char*)malloc(sizeof(char) * device_name_len);
+            err = clGetDeviceInfo(plat_devices[j], CL_DEVICE_NAME, device_name_len, plat_device_name, NULL); checkErr(err);
+            
+            cl_ulong device_mem;
+            err = clGetDeviceInfo(plat_devices[j], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &device_mem, NULL); checkErr(err);
+            
+            printf("\n  GPU %d.%d: %s (%.1f GB)", i, j, plat_device_name, (double)device_mem/1000000000);
+            free(plat_device_name);
+            total_gpus++;
+        }
+        
+        free(plat_devices);
+        free(platform_name);
+    }
+    
+    printf("\n\nTotal GPUs found: %d", total_gpus);
+    printf("\nNOTE: You might see fewer GPUs than physically installed due to OpenCL driver limitations.");
+    printf("\n*** END DIAGNOSTIC ***\n");
+    
+    // Continue with the original function to get devices from the selected platform
 #ifdef INTEL_CPU_PLATFORM
     err = clGetDeviceIDs(platforms[N], CL_DEVICE_TYPE_CPU, 0, NULL, &num_device); checkErr(err);
     *devices = (cl_device_id*)malloc(sizeof(cl_device_id) * num_device);
@@ -292,19 +370,18 @@ void SetupDevice(cl_platform_id* platforms, cl_device_id** devices, cl_int gpu_p
     err = clGetDeviceIDs(platforms[N], CL_DEVICE_TYPE_GPU, num_device, *devices, NULL); checkErr(err);
 #endif
     //Display devices info
+    printf("\nAvailable GPU devices on selected platform (%d found):", num_device);
     for (int i = 0; i < num_device; i++) {
         err = clGetDeviceInfo((*devices)[i], CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
         char* device_name = (char*)malloc(sizeof(char) * device_name_size);
         err = clGetDeviceInfo((*devices)[i], CL_DEVICE_NAME, device_name_size, device_name, NULL);
-        printf("\nGPU Device: %s", device_name);
-
-#ifdef DISPLAY_ADDITION_INFO
-        err = clGetDeviceInfo((*devices)[i], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &mem_size, NULL);
-        printf("Platform %d global memory size:%f GB\n", N, (double)mem_size/1000000000);
-        err = clGetDeviceInfo((*devices)[i], CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &mem_size, NULL);
-        printf("Platform %d local memory size:%f KB\n", N, (double)mem_size / 1000);
-#endif
+        
+        err = clGetDeviceInfo((*devices)[i], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &mem_size, NULL); checkErr(err);
+        
+        printf("\n  [%d] %s (%.1f GB)", i, device_name, (double)mem_size/1000000000);
+        free(device_name);
     }
+    printf("\nTo select a specific GPU, use --gpu_device <device_id> parameter\n");
 }
 
 
@@ -312,36 +389,78 @@ void SetupContext(cl_platform_id* platforms, cl_device_id* devices, cl_context* 
     cl_int err;
     //choose gpu_platform_id platform
     cl_context_properties properties[] = { CL_CONTEXT_PLATFORM, (cl_context_properties)(platforms[gpu_platform_id]), 0 };
-    cl_int num_device_in_context;
+    
+    // Create context with all devices
+    printf("\nCreating OpenCL context with %d device(s)", num_device);
     *context = clCreateContext(properties, num_device, devices, NULL, NULL, &err);
+    
     if (err == CL_SUCCESS) {
-#ifdef DISPLAY_SUCCESS
-        printf("Create context success!\n");
-#endif
+        // Verify how many devices are actually in the context
+        cl_uint num_devices_in_context;
+        err = clGetContextInfo(*context, CL_CONTEXT_NUM_DEVICES, sizeof(cl_uint), &num_devices_in_context, NULL); checkErr(err);
+        printf("\nDevices available in context: %d", num_devices_in_context);
+        
+        // Get the actual device IDs in the context
+        size_t device_id_size = num_devices_in_context * sizeof(cl_device_id);
+        cl_device_id* context_devices = (cl_device_id*)malloc(device_id_size);
+        err = clGetContextInfo(*context, CL_CONTEXT_DEVICES, device_id_size, context_devices, NULL); checkErr(err);
+        
+        // Show the devices in the context
+        for (cl_uint i = 0; i < num_devices_in_context; i++) {
+            size_t device_name_size;
+            err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
+            char* device_name = (char*)malloc(device_name_size);
+            err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, device_name_size, device_name, NULL); checkErr(err);
+            printf("\n  Context device %d: %s", i, device_name);
+            free(device_name);
+        }
+        
+        free(context_devices);
+    } else {
+        printf("\nFailed to create context! Error: %d (%s)", err, getErrorString(err));
+        exit(-1);
     }
-    else {
-        printf("Fail to create context! Err(%d)\n", err);
-    }
-    err = clGetContextInfo(*context, CL_CONTEXT_NUM_DEVICES, sizeof(cl_int), &num_device_in_context, NULL); checkErr(err);
-    //printf("\nDevice number in Context: %d\n", num_device_in_context);
 }
 
 
-void SetupQueue(cl_command_queue* queue, cl_context context, cl_device_id* devices) {
+void SetupQueue(cl_command_queue* queue, cl_context context, cl_device_id* devices, int device_id) {
     cl_int err = 0;
-    cl_command_queue_properties props[] = { CL_QUEUE_PROFILING_ENABLE};
-    //choose 0th device
-    *queue = clCreateCommandQueue(context, devices[0], *props, &err); checkErr(err);
-     
-    if (err == CL_SUCCESS) {
-#ifdef DISPLAY_SUCCESS
-        printf("Create queue success!\n");
-#endif
-    }
-    else {
-        printf("Fail to create queue! Err(%d)\n", err);
+    cl_command_queue_properties props[] = { CL_QUEUE_PROFILING_ENABLE };
+    
+    // Get devices from the context (not from the original devices list)
+    cl_uint num_devices = 0;
+    err = clGetContextInfo(context, CL_CONTEXT_NUM_DEVICES, sizeof(cl_uint), &num_devices, NULL); checkErr(err);
+    
+    // Retrieve the context devices
+    size_t device_id_size = num_devices * sizeof(cl_device_id);
+    cl_device_id* context_devices = (cl_device_id*)malloc(device_id_size);
+    err = clGetContextInfo(context, CL_CONTEXT_DEVICES, device_id_size, context_devices, NULL); checkErr(err);
+    
+    // Validate device_id
+    if (device_id >= num_devices) {
+        printf("\nWarning: Selected GPU device ID %d is out of range (only %d devices available in context). Falling back to device 0.\n", 
+               device_id, num_devices);
+        device_id = 0;
     }
     
+    // Display selected device info
+    size_t device_name_size;
+    err = clGetDeviceInfo(context_devices[device_id], CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
+    char* device_name = (char*)malloc(sizeof(char) * device_name_size);
+    err = clGetDeviceInfo(context_devices[device_id], CL_DEVICE_NAME, device_name_size, device_name, NULL);
+    printf("\nUsing GPU Device %d (from context): %s", device_id, device_name);
+    free(device_name);
+    
+    // Create command queue with selected device from context
+    *queue = clCreateCommandQueue(context, context_devices[device_id], *props, &err); checkErr(err);
+    
+    // Clean up
+    free(context_devices);
+    
+    if (err != CL_SUCCESS) {
+        printf("\nFailed to create command queue! Error: %d (%s)", err, getErrorString(err));
+        exit(-1);
+    }
 }
 
 
@@ -419,16 +538,88 @@ void SaveProgramToBinary(cl_program program_cl,const char* file_name) {
 cl_program SetupBuildProgramWithBinary(cl_context context, cl_device_id* devices, const char* binary_file_name) {
     cl_int err;
     cl_int binary_status;
+    
+    // Get the number of devices in the context
+    cl_uint num_devices = 0;
+    err = clGetContextInfo(context, CL_CONTEXT_NUM_DEVICES, sizeof(cl_uint), &num_devices, NULL); checkErr(err);
+    
+    // Get the actual device IDs in the context
+    size_t device_id_size = num_devices * sizeof(cl_device_id);
+    cl_device_id* context_devices = (cl_device_id*)malloc(device_id_size);
+    err = clGetContextInfo(context, CL_CONTEXT_DEVICES, device_id_size, context_devices, NULL); checkErr(err);
+    
+    // Load the binary file
     FILE* program_handle = fopen(binary_file_name, "r");
+    if (!program_handle) {
+        printf("\nError: Could not open binary file: %s", binary_file_name);
+        exit(-1);
+    }
+    
     fseek(program_handle, 0, SEEK_END);
     size_t program_size = ftell(program_handle);
     rewind(program_handle);
+    
     char* binary_buffer = (char*)malloc(program_size + 1);
     fread(binary_buffer, sizeof(char), program_size, program_handle);
     binary_buffer[program_size] = '\0';
     fclose(program_handle);
-    cl_program program_cl = clCreateProgramWithBinary(context, 1, devices, &program_size, (const unsigned char**)&binary_buffer, &binary_status, &err); checkErr(err);
-    err = clBuildProgram(program_cl, 1, devices, NULL, NULL, NULL); checkErr(err);
+    
+    // We need to create the program for each device in the context
+    size_t* binary_sizes = (size_t*)malloc(num_devices * sizeof(size_t));
+    char** binaries = (char**)malloc(num_devices * sizeof(char*));
+    
+    // Set up the same binary for all devices
+    for (cl_uint i = 0; i < num_devices; i++) {
+        binary_sizes[i] = program_size;
+        binaries[i] = binary_buffer;
+    }
+    
+    // Create the program with the binary for all devices
+    cl_program program_cl = clCreateProgramWithBinary(context, num_devices, context_devices, 
+                                                     binary_sizes, (const unsigned char**)binaries, 
+                                                     NULL, &err); checkErr(err);
+    
+    // Now build the program for all devices in the context
+    printf("\nBuilding OpenCL program for %d device(s)...", num_devices);
+    err = clBuildProgram(program_cl, num_devices, context_devices, NULL, NULL, NULL);
+    
+    if (err != CL_SUCCESS) {
+        printf("\nError: Failed to build program for one or more devices (Error: %d - %s)", 
+               err, getErrorString(err));
+        
+        // Print build log for all devices
+        for (cl_uint i = 0; i < num_devices; i++) {
+            size_t log_size;
+            err = clGetProgramBuildInfo(program_cl, context_devices[i], CL_PROGRAM_BUILD_LOG, 
+                                       0, NULL, &log_size); checkErr(err);
+            
+            char* build_log = (char*)malloc(log_size);
+            err = clGetProgramBuildInfo(program_cl, context_devices[i], CL_PROGRAM_BUILD_LOG, 
+                                       log_size, build_log, NULL); checkErr(err);
+            
+            // Get device name for better error reporting
+            size_t device_name_size;
+            err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
+            char* device_name = (char*)malloc(device_name_size);
+            err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, device_name_size, device_name, NULL); checkErr(err);
+            
+            printf("\nBuild log for device %d (%s):\n%s", i, device_name, build_log);
+            
+            free(device_name);
+            free(build_log);
+        }
+        
+        exit(-1);
+    } else {
+        printf("\nProgram built successfully for all devices");
+    }
+    
+    // Clean up
+    free(context_devices);
+    free(binary_sizes);
+    free(binaries);
+    free(binary_buffer);
+    
     return program_cl;
 }
 

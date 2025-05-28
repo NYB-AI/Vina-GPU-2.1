@@ -1,10 +1,10 @@
 # Need to be modified according to different users
-WORK_DIR=/home/shidi/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1
-BOOST_LIB_PATH=../../boost_1_84_0
+WORK_DIR=/home/duy/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1
+BOOST_LIB_PATH=/home/duy/boost_1_77_0
 OPENCL_LIB_PATH=/usr/local/cuda
-OPENCL_VERSION=-DOPENCL_2_0
+OPENCL_VERSION=-DOPENCL_3_0
 GPU_PLATFORM=-DNVIDIA_PLATFORM
-DOCKING_BOX_SIZE=-DSMALL_BOX
+DOCKING_BOX_SIZE=-DLARGE_BOX
 
 # Should not be modified
 BOOST_INC_PATH=-I$(BOOST_LIB_PATH) -I$(BOOST_LIB_PATH)/boost 

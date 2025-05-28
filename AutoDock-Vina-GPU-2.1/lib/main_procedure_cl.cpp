@@ -88,7 +88,7 @@ std::vector<output_type> cl_to_vina(output_type_cl result_ptr[],
 
 void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalculate& p, const parallel_mc par,
 	const vec& corner1, const vec& corner2, const int seed, std::vector<output_container>& outs, std::string opencl_binary_path,
-	const std::vector<std::vector<std::string>> ligand_names, const int rilc_bfgs) {
+	const std::vector<std::vector<std::string>> ligand_names, const int rilc_bfgs, const int gpu_device_id) {
 
 /**************************************************************************/
 /***************************    OpenCL Init    ****************************/
@@ -99,11 +99,32 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	cl_device_id* devices;
 	cl_context context;
 	cl_command_queue queue;
-	cl_int gpu_platform_id = 0;
+	cl_int gpu_platform_id = 1;
+	
+	printf("\nInitializing OpenCL with GPU device ID: %d", gpu_device_id);
+	printf("\nIf you have multiple GPUs, use --gpu_device <id> parameter to select a specific GPU");
+	
 	SetupPlatform(&platforms, &gpu_platform_id);
+	
+	// Get the number of devices on the selected platform
+	cl_uint num_devices = 0;
+	err = clGetDeviceIDs(platforms[gpu_platform_id], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devices); checkErr(err);
+	
+	// Set up device list
 	SetupDevice(platforms, &devices, gpu_platform_id);
-	SetupContext(platforms, devices, &context, 1, gpu_platform_id);
-	SetupQueue(&queue, context, devices);
+	
+	// Create context with all available devices
+	SetupContext(platforms, devices, &context, num_devices, gpu_platform_id);
+	
+	// Try to set up the queue with the requested device ID
+	try {
+		SetupQueue(&queue, context, devices, gpu_device_id);
+	} catch (const std::exception& e) {
+		printf("\nError setting up GPU device %d: %s", gpu_device_id, e.what());
+		printf("\nFalling back to device 0");
+		SetupQueue(&queue, context, devices, 0);
+	}
+	
 	cl_program programs[2];
 
 	//printf("\nSearch depth is set to %d", par.mc.search_depth);
@@ -160,9 +181,71 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	SetupBuildProgramWithSource(programs[1], NULL, devices, include_path, addtion);
 	SaveProgramToBinary(programs[1], "Kernel2_Opt.bin");
 #endif
-	programs[0] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel1_Opt.bin")).c_str());
 
-	programs[1] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel2_Opt.bin")).c_str());
+	// Try to load pre-compiled binaries first
+	try {
+		printf("\nAttempting to load pre-compiled OpenCL binaries for device %d...", gpu_device_id);
+		programs[0] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel1_Opt.bin")).c_str());
+		programs[1] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel2_Opt.bin")).c_str());
+	} 
+	catch (const std::exception& e) {
+		printf("\nError loading pre-compiled binaries: %s", e.what());
+		printf("\nThis may happen when using a different GPU than the one for which the binaries were compiled.");
+		printf("\nRebuilding kernels from source for the current device...");
+
+		// Fall back to building from source
+		const std::string default_work_path = ".";
+		const std::string include_path = default_work_path + "/OpenCL/inc";
+		const std::string addtion = "";
+
+		// Build kernel 1
+		printf("\nBuilding kernel 1 from source..."); fflush(stdout);
+		char* program1_file_n[NUM_OF_FILES_KERNEL_1];
+		size_t program1_size_n[NUM_OF_FILES_KERNEL_1];
+		std::string file1_paths[NUM_OF_FILES_KERNEL_1] = {
+			default_work_path + "/OpenCL/src/kernels/code_head.cl",
+			default_work_path + "/OpenCL/src/kernels/kernel1.cl"
+		};
+
+		read_n_file(program1_file_n, program1_size_n, file1_paths, NUM_OF_FILES_KERNEL_1);
+		std::string final_file;
+		size_t final_size = NUM_OF_FILES_KERNEL_1 - 1;
+		for (int i = 0; i < NUM_OF_FILES_KERNEL_1; i++) {
+			if (i == 0) final_file = program1_file_n[0];
+			else final_file = final_file + '\n' + (std::string)program1_file_n[i];
+			final_size += program1_size_n[i];
+		}
+		const char* final_files1_char = final_file.data();
+
+		programs[0] = clCreateProgramWithSource(context, 1, (const char**)&final_files1_char, &final_size, &err); checkErr(err);
+		SetupBuildProgramWithSource(programs[0], NULL, devices, include_path, addtion);
+		SaveProgramToBinary(programs[0], "Kernel1_Opt.bin");
+
+		// Build kernel 2
+		printf("\nBuilding kernel 2 from source..."); fflush(stdout);
+		char* program2_file_n[NUM_OF_FILES_KERNEL_2];
+		size_t program2_size_n[NUM_OF_FILES_KERNEL_2];
+		std::string file2_paths[NUM_OF_FILES_KERNEL_2] = {
+			default_work_path + "/OpenCL/src/kernels/code_head.cl",
+			default_work_path + "/OpenCL/src/kernels/mutate_conf.cl",
+			default_work_path + "/OpenCL/src/kernels/matrix.cl",
+			default_work_path + "/OpenCL/src/kernels/quasi_newton.cl",
+			default_work_path + "/OpenCL/src/kernels/kernel2.cl"
+		};
+
+		read_n_file(program2_file_n, program2_size_n, file2_paths, NUM_OF_FILES_KERNEL_2);
+		final_size = NUM_OF_FILES_KERNEL_2 - 1;
+		for (int i = 0; i < NUM_OF_FILES_KERNEL_2; i++) {
+			if (i == 0) final_file = program2_file_n[0];
+			else final_file = final_file + '\n' + (std::string)program2_file_n[i];
+			final_size += program2_size_n[i];
+		}
+		const char* final_files2_char = final_file.data();
+
+		programs[1] = clCreateProgramWithSource(context, 1, (const char**)&final_files2_char, &final_size, &err); checkErr(err);
+		SetupBuildProgramWithSource(programs[1], NULL, devices, include_path, addtion);
+		SaveProgramToBinary(programs[1], "Kernel2_Opt.bin");
+	}
 
 	err = clUnloadPlatformCompiler(platforms[gpu_platform_id]); checkErr(err);
 	//Set kernel arguments

@@ -1,0 +1,29 @@
+/home/thanh/projects/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/AutoDock-Vina-GPU-2-1 \
+--thread 8000 \
+--opencl_binary_path /home/thanh/projects/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1 \
+--receptor "/home/thanh/data/CHEMBL211/protein/4MQT_protein.pdbqt" \
+--ligand "/home/thanh/data/CHEMBL211/ligand/pdbqt/CHEMBL3936289.pdbqt" \
+--config "/home/thanh/data/CHEMBL211/protein/vina_pocket_1.txt" \
+--out "/home/thanh/data/CHEMBL211/4MQT/vina/docking_data/pocket_1/CHEMBL3936289.pdbqt"
+
+/home/duy/DTIGN/notebooks/data/delightX/CHEMBL214/8PJK/vina/docking_data/pocket_1/CHEMBL2.pdbqt
+
+/home/duy/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/AutoDock-Vina-GPU-2-1 --gpu_device 1 \
+--thread 8000 \
+--opencl_binary_path /home/duy/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1 \
+--receptor "/home/duy/DTIGN/notebooks/data/delightX/CHEMBL214/protein/8PJK_protein.pdbqt" \
+--ligand "/home/duy/DTIGN/notebooks/data/delightX/CHEMBL214/ligand/pdbqt/CHEMBL2.pdbqt" \
+--config "/home/duy/DTIGN/notebooks/data/delightX/CHEMBL214/protein/vina_pocket_1.txt" \
+--out "/home/duy/DTIGN/notebooks/data/delightX/CHEMBL214/8PJK/vina/docking_data/pocket_1/CHEMBL2.pdbqt"
+
+/home/duy/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1/AutoDock-Vina-GPU-2-1 \
+--thread 8000 \
+--opencl_binary_path /home/duy/Vina-GPU-2.1/AutoDock-Vina-GPU-2.1 \
+--receptor "/home/duy/DTIGN-deployment/inference-data/CHEMBL5137/protein/4XAQ_protein.pdbqt" \
+--ligand "/home/duy/DTIGN-deployment/inference-data/coconut-pdbqt/CNP0574134.1.pdbqt" \
+--config "/home/duy/DTIGN-deployment/inference-data/CHEMBL5137/protein/vina_pocket_2.txt" \
+--out "/home/duy/DTIGN-deployment/inference-data/CHEMBL5137/4XAQ/vina/docking_data/pocket_2/CNP0574134.pdbqt" \
+--gpu-device 1
+
+
+log << "WARNING: The search space volume > 27000 Angstrom^3 (See FAQ)\n";

@@ -285,7 +285,7 @@ void main_procedure(std::vector<model>& ms, const boost::optional<model>& ref, /
 	const grid_dims& gd, int exhaustiveness,
 	const flv& weights,
 	int cpu, int seed, int verbosity, sz num_modes, fl energy_range, 
-	tee& log, int search_depth, int thread, std::string opencl_binary_path, std::vector<std::vector<std::string>> ligand_names, int rilc_bfgs) {
+	tee& log, int search_depth, int thread, std::string opencl_binary_path, std::vector<std::vector<std::string>> ligand_names, int rilc_bfgs, int gpu_device_id) {
 
 	doing(verbosity, "Setting up the scoring function", log);
 
@@ -350,7 +350,7 @@ void main_procedure(std::vector<model>& ms, const boost::optional<model>& ref, /
 	done(verbosity, log);
 
 	std::vector<output_container> out_conts(ligand_num);
-	main_procedure_cl(c, ms, prec, par, corner1, corner2, seed, out_conts, opencl_binary_path, ligand_names, rilc_bfgs);
+	main_procedure_cl(c, ms, prec, par, corner1, corner2, seed, out_conts, opencl_binary_path, ligand_names, rilc_bfgs, gpu_device_id);
 	
 	const vec authentic_v(1000, 1000, 1000);
 	const scoring_function& sf = wt;
@@ -548,6 +548,7 @@ Thank you!\n";
 		std::string ligand_directory, output_directory, opencl_binary_path;
 		opencl_binary_path = ".";
 		int rilc_bfgs = 1;
+		int gpu_device_id = 0; // Default to first GPU
 		
 		// -0.035579, -0.005156, 0.840245, -0.035069, -0.587439, 0.05846
 		fl weight_gauss1 = -0.035579;
@@ -571,6 +572,7 @@ Thank you!\n";
 			("search_depth", value<int>(&search_depth), "the number of search depth in monte carlo")
 			("opencl_binary_path", value<std::string>(&opencl_binary_path)->default_value(opencl_binary_path), "opencl precompiled binary file path")
 			("rilc_bfgs",value<int>(&rilc_bfgs)->default_value(rilc_bfgs), "rilc_bfgs enable or not")
+			("gpu_device", value<int>(&gpu_device_id)->default_value(0), "specify which GPU device to use (0 for first GPU, 1 for second, etc.)")
 			;
 		//options_description search_area("Search area (required, except with --score_only)");
 		options_description search_area("Search space (required)");
@@ -852,7 +854,7 @@ Thank you!\n";
 			score_only, local_only, randomize_only, false, // no_cache == false
 			gd, exhaustiveness,
 			weights,
-			cpu, seed, verbosity, max_modes_sz, energy_range, log, search_depth, thread, opencl_binary_path, ligand_names, rilc_bfgs);
+			cpu, seed, verbosity, max_modes_sz, energy_range, log, search_depth, thread, opencl_binary_path, ligand_names, rilc_bfgs, gpu_device_id);
 	}
 	catch (file_error& e) {
 		std::cerr << "\n\nError: could not open \"" << e.name.string() << "\" for " << (e.in ? "reading" : "writing") << ".\n";
