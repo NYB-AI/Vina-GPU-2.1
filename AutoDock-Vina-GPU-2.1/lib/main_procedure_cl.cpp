@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <iomanip>
 #include <stdio.h>
+#include "box_utils.h"
 
 using namespace std;
 volatile enum { FINISH, DOCKING, ABORT} status;
