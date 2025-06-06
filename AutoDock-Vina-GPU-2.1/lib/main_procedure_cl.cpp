@@ -114,7 +114,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	SetupDevice(platforms, &devices, gpu_platform_id);
 	
 	// Create context with all available devices
-	SetupContext(platforms, devices, &context, num_devices, gpu_platform_id);
+	SetupContext(platforms, devices[gpu_device_id], &context, gpu_platform_id);
 	
 	// Try to set up the queue with the requested device ID
 	try {
@@ -185,8 +185,8 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	// Try to load pre-compiled binaries first
 	try {
 		printf("\nAttempting to load pre-compiled OpenCL binaries for device %d...", gpu_device_id);
-		programs[0] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel1_Opt.bin")).c_str());
-		programs[1] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel2_Opt.bin")).c_str());
+		programs[0] = SetupBuildProgramWithBinary(context, devices[gpu_device_id], (opencl_binary_path + std::string("/Kernel1_Opt.bin")).c_str());
+		programs[1] = SetupBuildProgramWithBinary(context, devices[gpu_device_id], (opencl_binary_path + std::string("/Kernel2_Opt.bin")).c_str());
 	} 
 	catch (const std::exception& e) {
 		printf("\nError loading pre-compiled binaries: %s", e.what());
