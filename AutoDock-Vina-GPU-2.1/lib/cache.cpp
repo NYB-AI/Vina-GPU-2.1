@@ -309,7 +309,7 @@ void cache::populate_cl(const model& m, const precalculate& p, const szv& atom_t
 	cl_int gpu_platform_id = 1;
 	SetupPlatform(&platforms, &gpu_platform_id);
 	SetupDevice(platforms, &devices, gpu_platform_id);
-	SetupContext(platforms, devices, &context, 1, gpu_platform_id);
+	SetupContext(platforms, devices[0], &context, gpu_platform_id);
 	SetupQueue(&queue, context, devices);
 	char* program_file;
 	cl_program program_cl;
@@ -343,7 +343,7 @@ void cache::populate_cl(const model& m, const precalculate& p, const szv& atom_t
 	SaveProgramToBinary(program_cl, "Kernel1_Opt.bin");
 	*/
 
-	program_cl = SetupBuildProgramWithBinary(context, devices, "Kernel1_Opt.bin");
+	program_cl = SetupBuildProgramWithBinary(context, devices[0], "Kernel1_Opt.bin");
 
 	err = clUnloadPlatformCompiler(platforms[gpu_platform_id]); checkErr(err);
 	//Set kernel arguments

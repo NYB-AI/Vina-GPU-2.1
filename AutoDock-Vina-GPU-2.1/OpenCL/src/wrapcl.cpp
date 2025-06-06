@@ -385,27 +385,18 @@ void SetupDevice(cl_platform_id* platforms, cl_device_id** devices, cl_int gpu_p
 }
 
 
-void SetupContext(cl_platform_id* platforms, cl_device_id* devices, cl_context* context, cl_uint num_device, cl_int gpu_platform_id) {
+void SetupContext(cl_platform_id* platforms, cl_device_id device, cl_context* context, cl_int gpu_platform_id) {
     cl_int err;
-    //choose gpu_platform_id platform
     cl_context_properties properties[] = { CL_CONTEXT_PLATFORM, (cl_context_properties)(platforms[gpu_platform_id]), 0 };
-    
-    // Create context with all devices
-    printf("\nCreating OpenCL context with %d device(s)", num_device);
-    *context = clCreateContext(properties, num_device, devices, NULL, NULL, &err);
-    
+    printf("\nCreating OpenCL context with 1 device");
+    *context = clCreateContext(properties, 1, &device, NULL, NULL, &err);
     if (err == CL_SUCCESS) {
-        // Verify how many devices are actually in the context
         cl_uint num_devices_in_context;
         err = clGetContextInfo(*context, CL_CONTEXT_NUM_DEVICES, sizeof(cl_uint), &num_devices_in_context, NULL); checkErr(err);
         printf("\nDevices available in context: %d", num_devices_in_context);
-        
-        // Get the actual device IDs in the context
         size_t device_id_size = num_devices_in_context * sizeof(cl_device_id);
         cl_device_id* context_devices = (cl_device_id*)malloc(device_id_size);
         err = clGetContextInfo(*context, CL_CONTEXT_DEVICES, device_id_size, context_devices, NULL); checkErr(err);
-        
-        // Show the devices in the context
         for (cl_uint i = 0; i < num_devices_in_context; i++) {
             size_t device_name_size;
             err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
@@ -414,7 +405,6 @@ void SetupContext(cl_platform_id* platforms, cl_device_id* devices, cl_context* 
             printf("\n  Context device %d: %s", i, device_name);
             free(device_name);
         }
-        
         free(context_devices);
     } else {
         printf("\nFailed to create context! Error: %d (%s)", err, getErrorString(err));
@@ -535,91 +525,56 @@ void SaveProgramToBinary(cl_program program_cl,const char* file_name) {
 }
 
 
-cl_program SetupBuildProgramWithBinary(cl_context context, cl_device_id* devices, const char* binary_file_name) {
+cl_program SetupBuildProgramWithBinary(cl_context context, cl_device_id device, const char* binary_file_name) {
     cl_int err;
     cl_int binary_status;
     
-    // Get the number of devices in the context
+    // Get the number of devices in the context (should be 1)
     cl_uint num_devices = 0;
     err = clGetContextInfo(context, CL_CONTEXT_NUM_DEVICES, sizeof(cl_uint), &num_devices, NULL); checkErr(err);
-    
-    // Get the actual device IDs in the context
-    size_t device_id_size = num_devices * sizeof(cl_device_id);
-    cl_device_id* context_devices = (cl_device_id*)malloc(device_id_size);
-    err = clGetContextInfo(context, CL_CONTEXT_DEVICES, device_id_size, context_devices, NULL); checkErr(err);
-    
+    if (num_devices != 1) {
+        printf("\nError: Context does not have exactly one device!\n");
+        exit(-1);
+    }
+    // Get the actual device ID in the context
+    cl_device_id context_device;
+    err = clGetContextInfo(context, CL_CONTEXT_DEVICES, sizeof(cl_device_id), &context_device, NULL); checkErr(err);
     // Load the binary file
     FILE* program_handle = fopen(binary_file_name, "r");
     if (!program_handle) {
         printf("\nError: Could not open binary file: %s", binary_file_name);
         exit(-1);
     }
-    
     fseek(program_handle, 0, SEEK_END);
     size_t program_size = ftell(program_handle);
     rewind(program_handle);
-    
     char* binary_buffer = (char*)malloc(program_size + 1);
     fread(binary_buffer, sizeof(char), program_size, program_handle);
     binary_buffer[program_size] = '\0';
     fclose(program_handle);
-    
-    // We need to create the program for each device in the context
-    size_t* binary_sizes = (size_t*)malloc(num_devices * sizeof(size_t));
-    char** binaries = (char**)malloc(num_devices * sizeof(char*));
-    
-    // Set up the same binary for all devices
-    for (cl_uint i = 0; i < num_devices; i++) {
-        binary_sizes[i] = program_size;
-        binaries[i] = binary_buffer;
-    }
-    
-    // Create the program with the binary for all devices
-    cl_program program_cl = clCreateProgramWithBinary(context, num_devices, context_devices, 
-                                                     binary_sizes, (const unsigned char**)binaries, 
-                                                     NULL, &err); checkErr(err);
-    
-    // Now build the program for all devices in the context
-    printf("\nBuilding OpenCL program for %d device(s)...", num_devices);
-    err = clBuildProgram(program_cl, num_devices, context_devices, NULL, NULL, NULL);
-    
+    size_t binary_size = program_size;
+    const unsigned char* binaries[1] = { (const unsigned char*)binary_buffer };
+    cl_program program_cl = clCreateProgramWithBinary(context, 1, &context_device, &binary_size, binaries, &binary_status, &err); checkErr(err);
+    printf("\nBuilding OpenCL program for 1 device...");
+    err = clBuildProgram(program_cl, 1, &context_device, NULL, NULL, NULL);
     if (err != CL_SUCCESS) {
-        printf("\nError: Failed to build program for one or more devices (Error: %d - %s)", 
-               err, getErrorString(err));
-        
-        // Print build log for all devices
-        for (cl_uint i = 0; i < num_devices; i++) {
-            size_t log_size;
-            err = clGetProgramBuildInfo(program_cl, context_devices[i], CL_PROGRAM_BUILD_LOG, 
-                                       0, NULL, &log_size); checkErr(err);
-            
-            char* build_log = (char*)malloc(log_size);
-            err = clGetProgramBuildInfo(program_cl, context_devices[i], CL_PROGRAM_BUILD_LOG, 
-                                       log_size, build_log, NULL); checkErr(err);
-            
-            // Get device name for better error reporting
-            size_t device_name_size;
-            err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
-            char* device_name = (char*)malloc(device_name_size);
-            err = clGetDeviceInfo(context_devices[i], CL_DEVICE_NAME, device_name_size, device_name, NULL); checkErr(err);
-            
-            printf("\nBuild log for device %d (%s):\n%s", i, device_name, build_log);
-            
-            free(device_name);
-            free(build_log);
-        }
-        
+        printf("\nError: Failed to build program for device (Error: %d - %s)", err, getErrorString(err));
+        size_t log_size;
+        err = clGetProgramBuildInfo(program_cl, context_device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size); checkErr(err);
+        char* build_log = (char*)malloc(log_size);
+        err = clGetProgramBuildInfo(program_cl, context_device, CL_PROGRAM_BUILD_LOG, log_size, build_log, NULL); checkErr(err);
+        size_t device_name_size;
+        err = clGetDeviceInfo(context_device, CL_DEVICE_NAME, 0, NULL, &device_name_size); checkErr(err);
+        char* device_name = (char*)malloc(device_name_size);
+        err = clGetDeviceInfo(context_device, CL_DEVICE_NAME, device_name_size, device_name, NULL); checkErr(err);
+        printf("\nBuild log for device (%s):\n%s", device_name, build_log);
+        free(device_name);
+        free(build_log);
         exit(-1);
     } else {
-        printf("\nProgram built successfully for all devices");
+        printf("\nProgram built successfully for device");
     }
-    
-    // Clean up
-    free(context_devices);
-    free(binary_sizes);
-    free(binaries);
     free(binary_buffer);
-    
     return program_cl;
 }
 
