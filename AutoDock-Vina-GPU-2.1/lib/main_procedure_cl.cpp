@@ -19,8 +19,17 @@
 #include <stdio.h>
 #include <cstdlib>
 #include <unistd.h>
+#include <algorithm>
 
 namespace {
+// Every replica starts from the same state, so each SoA row (one scalar field
+// across all `thread` replicas) holds a single constant. Fill it contiguously
+// rather than scattering one float per replica at stride `thread`.
+inline void soa_fill(float* soa, int offset, int i, int j, int dim_j, int thread, float v) {
+	float* row = soa + (size_t)(offset + i * dim_j + j) * (size_t)thread;
+	std::fill(row, row + thread, v);
+}
+
 inline std::string vina_gpu_log_path() {
 	const char* env = std::getenv("VINA_GPU_LOG");
 	if (env) return std::string(env);
@@ -592,7 +601,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 		m_ro_cl* m_ptr = m_ptrs[ligand_count];
 
 		size_t soa_size = TOTAL_MUTABLE_DIM * par.mc.thread * sizeof(float);
-		float* soa_ptr = (float*)malloc(soa_size);
+		float* soa_ptr = (float*)calloc(1, soa_size);
 
 		for (int i = 0; i < m.atoms.size(); i++) {
 			m_ptr->atoms[i].types[0] = m.atoms[i].el;// To store 4 atoms types (el, ad, xs, sy)
@@ -604,19 +613,11 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 			}
 		}
 
-		for (int t = 0; t < par.mc.thread; t++) {
-			// To store atoms coords
-			for (int i = 0; i < m.coords.size(); i++) {
-				for (int j = 0; j < 3; j++) {
-					soa_ptr[SOA_IDX(M_COORDS_OFFSET, i, j, 3, t, par.mc.thread)] = m.coords[i].data[j];
-				}
-			}
-
-			//To store minus forces
-			for (int i = 0; i < m.coords.size(); i++) {
-				for (int j = 0; j < 3; j++) {
-					soa_ptr[SOA_IDX(MINUS_FORCES_OFFSET, i, j, 3, t, par.mc.thread)] = m.minus_forces[i].data[j];
-				}
+		// To store atoms coords and minus forces (identical for every replica)
+		for (int i = 0; i < m.coords.size(); i++) {
+			for (int j = 0; j < 3; j++) {
+				soa_fill(soa_ptr, M_COORDS_OFFSET, i, j, 3, par.mc.thread, m.coords[i].data[j]);
+				soa_fill(soa_ptr, MINUS_FORCES_OFFSET, i, j, 3, par.mc.thread, m.minus_forces[i].data[j]);
 			}
 		}
 
@@ -647,17 +648,13 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 			m_ptr->ligand.rigid.relative_axis[0][i] = 0;
 			m_ptr->ligand.rigid.relative_origin[0][i] = 0;
 		}
-		for (int t = 0; t < par.mc.thread; t++) {
-			for (int i = 0; i < 3; i++) soa_ptr[SOA_IDX(ORIGIN_OFFSET, 0, i, 3, t, par.mc.thread)] = m_ligand.node.get_origin()[i];
-			for (int i = 0; i < 9; i++) soa_ptr[SOA_IDX(ORIENTATION_M_OFFSET, 0, i, 9, t, par.mc.thread)] = m_ligand.node.get_orientation_m().data[i];
-			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 0, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_1();
-			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 1, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_2();
-			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 2, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_3();
-			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 3, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_4();
-			for (int i = 0; i < 3; i++) {
-				soa_ptr[SOA_IDX(AXIS_OFFSET, 0, i, 3, t, par.mc.thread)] = 0;
-			}
-		}
+		for (int i = 0; i < 3; i++) soa_fill(soa_ptr, ORIGIN_OFFSET, 0, i, 3, par.mc.thread, m_ligand.node.get_origin()[i]);
+		for (int i = 0; i < 9; i++) soa_fill(soa_ptr, ORIENTATION_M_OFFSET, 0, i, 9, par.mc.thread, m_ligand.node.get_orientation_m().data[i]);
+		soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, 0, 0, 4, par.mc.thread, m_ligand.node.orientation().R_component_1());
+		soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, 0, 1, 4, par.mc.thread, m_ligand.node.orientation().R_component_2());
+		soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, 0, 2, 4, par.mc.thread, m_ligand.node.orientation().R_component_3());
+		soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, 0, 3, 4, par.mc.thread, m_ligand.node.orientation().R_component_4());
+		for (int i = 0; i < 3; i++) soa_fill(soa_ptr, AXIS_OFFSET, 0, i, 3, par.mc.thread, 0.0f);
 
 		struct tmp_struct {
 			int start_index = 0;
@@ -673,16 +670,14 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 					rigid.relative_axis[start_index][i] = child_ptr.node.relative_axis[i];
 					rigid.relative_origin[start_index][i] = child_ptr.node.relative_origin[i];
 				}
-				for (int t = 0; t < thread_count; t++) {
-					for (int i = 0; i < 9; i++) soa_ptr[SOA_IDX(ORIENTATION_M_OFFSET, start_index, i, 9, t, thread_count)] = child_ptr.node.get_orientation_m().data[i];
-					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 0, 4, t, thread_count)] = child_ptr.node.orientation().R_component_1();
-					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 1, 4, t, thread_count)] = child_ptr.node.orientation().R_component_2();
-					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 2, 4, t, thread_count)] = child_ptr.node.orientation().R_component_3();
-					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 3, 4, t, thread_count)] = child_ptr.node.orientation().R_component_4();
-					for (int i = 0; i < 3; i++) {
-						soa_ptr[SOA_IDX(ORIGIN_OFFSET, start_index, i, 3, t, thread_count)] = child_ptr.node.get_origin()[i];
-						soa_ptr[SOA_IDX(AXIS_OFFSET, start_index, i, 3, t, thread_count)] = child_ptr.node.get_axis()[i];
-					}
+				for (int i = 0; i < 9; i++) soa_fill(soa_ptr, ORIENTATION_M_OFFSET, start_index, i, 9, thread_count, child_ptr.node.get_orientation_m().data[i]);
+				soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, start_index, 0, 4, thread_count, child_ptr.node.orientation().R_component_1());
+				soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, start_index, 1, 4, thread_count, child_ptr.node.orientation().R_component_2());
+				soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, start_index, 2, 4, thread_count, child_ptr.node.orientation().R_component_3());
+				soa_fill(soa_ptr, ORIENTATION_Q_OFFSET, start_index, 3, 4, thread_count, child_ptr.node.orientation().R_component_4());
+				for (int i = 0; i < 3; i++) {
+					soa_fill(soa_ptr, ORIGIN_OFFSET, start_index, i, 3, thread_count, child_ptr.node.get_origin()[i]);
+					soa_fill(soa_ptr, AXIS_OFFSET, start_index, i, 3, thread_count, child_ptr.node.get_axis()[i]);
 				}
 				if (child_ptr.children.size() == 0) return;
 				else {
