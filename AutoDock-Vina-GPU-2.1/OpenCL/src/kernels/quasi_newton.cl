@@ -199,7 +199,10 @@ float ig_eval_deriv(						output_type_cl*		x,
 											change_cl*			g, 
 						const				float				v,
 								__constant	grids_cl*			grids,
-											m_cl*				m,
+						const	__global	m_ro_cl* restrict	m,
+											__global float* m_soa_buffer,
+											int thread_id,
+											int total_threads,
 						const				float				epsilon_fl
 ) {
 	float e = 0;
@@ -207,14 +210,16 @@ float ig_eval_deriv(						output_type_cl*		x,
 	for (int i = 0; i < m->m_num_movable_atoms; i++) {
 		int t = m->atoms[i].types[grids->atu];
 		if (t >= nat) {
-			for (int j = 0; j < 3; j++)m->minus_forces.coords[i][j] = 0;
+			for (int j = 0; j < 3; j++) m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, i, j, 3, thread_id, total_threads)] = 0;
 			continue;
 		}
 		float deriv[3];
+		float m_coords_i[3] = {m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 0, 3, thread_id, total_threads)],
+							   m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 1, 3, thread_id, total_threads)],
+							   m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 2, 3, thread_id, total_threads)]};
+		e = e + g_evaluate(&grids->grids[t], m_coords_i, grids->slope, v, deriv, epsilon_fl);
 
-		e = e + g_evaluate(&grids->grids[t], m->m_coords.coords[i], grids->slope, v, deriv, epsilon_fl);
-
-		for (int j = 0; j < 3; j++) m->minus_forces.coords[i][j] = deriv[j];
+		for (int j = 0; j < 3; j++) m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, i, j, 3, thread_id, total_threads)] = deriv[j];
 	}
 	return e;
 }
@@ -305,59 +310,81 @@ inline void angle_to_quaternion2(				float*		out,
 }
 
 void set(	const				output_type_cl* x,
-								rigid_cl*		lig_rigid_gpu,
-								m_coords_cl*	m_coords_gpu,	
-			const				atom_cl*		atoms,				
-			const				int				m_num_movable_atoms,
+			const	__global	m_ro_cl* restrict	m,
+								__global float* m_soa_buffer,
+								int thread_id,
+								int total_threads,
 			const				float			epsilon_fl
 ) {
 	//************** (root) node.set_conf **************// (CHECKED)
-	for (int i = 0; i < 3; i++) lig_rigid_gpu->origin[0][i] = x->position[i]; // set origin
-	for (int i = 0; i < 4; i++) lig_rigid_gpu->orientation_q[0][i] = x->orientation[i]; // set orientation_q
-	quaternion_to_r3(lig_rigid_gpu->orientation_q[0], lig_rigid_gpu->orientation_m[0]);// set orientation_m
+	for (int i = 0; i < 3; i++) m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, i, 3, thread_id, total_threads)] = x->position[i]; // set origin
+	for (int i = 0; i < 4; i++) m_soa_buffer[SOA_IDX(ORIENTATION_Q_OFFSET, 0, i, 4, thread_id, total_threads)] = x->orientation[i]; // set orientation_q
+	
+	float q_tmp[4] = { x->orientation[0], x->orientation[1], x->orientation[2], x->orientation[3] };
+	float m_tmp[9];
+	quaternion_to_r3(q_tmp, m_tmp);// set orientation_m
+	for(int i=0; i<9; ++i) m_soa_buffer[SOA_IDX(ORIENTATION_M_OFFSET, 0, i, 9, thread_id, total_threads)] = m_tmp[i];
 	// set coords
-	int begin = lig_rigid_gpu->atom_range[0][0];
-	int end =	lig_rigid_gpu->atom_range[0][1];
+	int begin = m->ligand.rigid.atom_range[0][0];
+	int end =	m->ligand.rigid.atom_range[0][1];
 	for (int i = begin; i < end; i++) {
-		local_to_lab(m_coords_gpu->coords[i], lig_rigid_gpu->origin[0], &atoms[i].coords[0], lig_rigid_gpu->orientation_m[0]);
+		float out_coords[3];
+		float origin[3] = {m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, 0, 3, thread_id, total_threads)],
+						   m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, 1, 3, thread_id, total_threads)],
+						   m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, 2, 3, thread_id, total_threads)]};
+		local_to_lab(out_coords, origin, &m->atoms[i].coords[0], m_tmp);
+		for(int j=0; j<3; ++j) m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, j, 3, thread_id, total_threads)] = out_coords[j];
 	}
 	//************** end node.set_conf **************//
 
 	//************** branches_set_conf **************//
 	//update nodes in depth-first order
-	for (int current = 1; current < lig_rigid_gpu->num_children + 1; current++) { // current starts from 1 (namely starts from first child node)
-		int parent = lig_rigid_gpu->parent[current];
+	for (int current = 1; current < m->ligand.rigid.num_children + 1; current++) { // current starts from 1 (namely starts from first child node)
+		int parent = m->ligand.rigid.parent[current];
 		float torsion = x->lig_torsion[current - 1]; // torsions are all related to child nodes
-		local_to_lab(	lig_rigid_gpu->origin[current],
-						lig_rigid_gpu->origin[parent],
-						lig_rigid_gpu->relative_origin[current],
-						lig_rigid_gpu->orientation_m[parent]
-						); // set origin
-		local_to_lab_direction(	lig_rigid_gpu->axis[current],
-								lig_rigid_gpu->relative_axis[current],
-								lig_rigid_gpu->orientation_m[parent]
-								); // set axis
+		float parent_origin[3] = {m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, parent, 0, 3, thread_id, total_threads)],
+								  m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, parent, 1, 3, thread_id, total_threads)],
+								  m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, parent, 2, 3, thread_id, total_threads)]};
+		float parent_m[9];
+		for(int j=0; j<9; ++j) parent_m[j] = m_soa_buffer[SOA_IDX(ORIENTATION_M_OFFSET, parent, j, 9, thread_id, total_threads)];
+		float rel_orig[3] = {m->ligand.rigid.relative_origin[current][0],
+							 m->ligand.rigid.relative_origin[current][1],
+							 m->ligand.rigid.relative_origin[current][2]};
+							 
+		float new_origin[3];
+		local_to_lab(	new_origin, parent_origin, rel_orig, parent_m ); // set origin
+		for(int j=0; j<3; ++j) m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, current, j, 3, thread_id, total_threads)] = new_origin[j];
+		
+		float rel_axis[3] = {m->ligand.rigid.relative_axis[current][0],
+							 m->ligand.rigid.relative_axis[current][1],
+							 m->ligand.rigid.relative_axis[current][2]};
+		float new_axis[3];
+		local_to_lab_direction(	new_axis, rel_axis, parent_m ); // set axis
+		for(int j=0; j<3; ++j) m_soa_buffer[SOA_IDX(AXIS_OFFSET, current, j, 3, thread_id, total_threads)] = new_axis[j];
+		
 		float tmp[4];
-		float parent_q[4] = {	lig_rigid_gpu->orientation_q[parent][0],
-								lig_rigid_gpu->orientation_q[parent][1] ,
-								lig_rigid_gpu->orientation_q[parent][2] ,
-								lig_rigid_gpu->orientation_q[parent][3] };
-		float current_axis[3] = {	lig_rigid_gpu->axis[current][0],
-									lig_rigid_gpu->axis[current][1],
-									lig_rigid_gpu->axis[current][2] };
+		float parent_q[4] = {	m_soa_buffer[SOA_IDX(ORIENTATION_Q_OFFSET, parent, 0, 4, thread_id, total_threads)],
+								m_soa_buffer[SOA_IDX(ORIENTATION_Q_OFFSET, parent, 1, 4, thread_id, total_threads)],
+								m_soa_buffer[SOA_IDX(ORIENTATION_Q_OFFSET, parent, 2, 4, thread_id, total_threads)],
+								m_soa_buffer[SOA_IDX(ORIENTATION_Q_OFFSET, parent, 3, 4, thread_id, total_threads)] };
+		float current_axis[3] = {	new_axis[0], new_axis[1], new_axis[2] };
 
 		angle_to_quaternion2(tmp, current_axis, torsion);
 		angle_to_quaternion_multi(tmp, parent_q);
 		quaternion_normalize_approx(tmp, epsilon_fl);
 
-		for (int i = 0; i < 4; i++) lig_rigid_gpu->orientation_q[current][i] = tmp[i]; // set orientation_q
-		quaternion_to_r3(lig_rigid_gpu->orientation_q[current], lig_rigid_gpu->orientation_m[current]); // set orientation_m
+		for (int i = 0; i < 4; i++) m_soa_buffer[SOA_IDX(ORIENTATION_Q_OFFSET, current, i, 4, thread_id, total_threads)] = tmp[i]; // set orientation_q
+		float new_m[9];
+		quaternion_to_r3(tmp, new_m); // set orientation_m
+		for (int i = 0; i < 9; i++) m_soa_buffer[SOA_IDX(ORIENTATION_M_OFFSET, current, i, 9, thread_id, total_threads)] = new_m[i];
 
 		// set coords
-		begin = lig_rigid_gpu->atom_range[current][0];
-		end =	lig_rigid_gpu->atom_range[current][1];
+		begin = m->ligand.rigid.atom_range[current][0];
+		end =	m->ligand.rigid.atom_range[current][1];
 		for (int i = begin; i < end; i++) {
-			local_to_lab(m_coords_gpu->coords[i], lig_rigid_gpu->origin[current], &atoms[i].coords[0], lig_rigid_gpu->orientation_m[current]);
+			float out_coords[3];
+			local_to_lab(out_coords, new_origin, &m->atoms[i].coords[0], new_m);
+			for(int j=0; j<3; ++j) m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, j, 3, thread_id, total_threads)] = out_coords[j];
 		}
 	}
 	//************** end branches_set_conf **************//
@@ -399,17 +426,18 @@ inline void curl(float* e, float* deriv, float v, const float epsilon_fl) {
 
 float eval_interacting_pairs_deriv(			__constant	pre_cl*			pre,
 									const				float			v,
-									const				lig_pairs_cl*   pairs,
-									const			 	m_coords_cl*	m_coords,
-														m_minus_forces* minus_forces,
+									const	__global	lig_pairs_cl*   pairs,
+														__global float* m_soa_buffer,
+														int thread_id,
+														int total_threads,
 									const				float			epsilon_fl
 ) {
 	float e = 0;
 
 	for (int i = 0; i < pairs->num_pairs; i++) {
 		const int ip[3] = { pairs->type_pair_index[i], pairs->a[i] ,pairs->b[i] };
-		float coords_b[3] = { m_coords->coords[ip[2]][0], m_coords->coords[ip[2]][1], m_coords->coords[ip[2]][2] };
-		float coords_a[3] = { m_coords->coords[ip[1]][0], m_coords->coords[ip[1]][1], m_coords->coords[ip[1]][2] };
+		float coords_b[3] = { m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, ip[2], 0, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, ip[2], 1, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, ip[2], 2, 3, thread_id, total_threads)] };
+		float coords_a[3] = { m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, ip[1], 0, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, ip[1], 1, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, ip[1], 2, 3, thread_id, total_threads)] };
 		float r[3] = { coords_b[0] - coords_a[0], coords_b[1] - coords_a[1] ,coords_b[2] - coords_a[2] };
 		float r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
 	
@@ -419,8 +447,8 @@ float eval_interacting_pairs_deriv(			__constant	pre_cl*			pre,
 			float force[3] = { r[0] * tmp[1], r[1] * tmp[1] ,r[2] * tmp[1] };
 			curl(&tmp[0], force, v, epsilon_fl);
 			e += tmp[0];
-			for (int j = 0; j < 3; j++)minus_forces->coords[ip[1]][j] -= force[j];
-			for (int j = 0; j < 3; j++)minus_forces->coords[ip[2]][j] += force[j];
+			for (int j = 0; j < 3; j++) m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, ip[1], j, 3, thread_id, total_threads)] -= force[j];
+			for (int j = 0; j < 3; j++) m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, ip[2], j, 3, thread_id, total_threads)] += force[j];
 		}
 	}
 	return e;
@@ -432,12 +460,13 @@ inline void product(float* res, const float*a,const float*b) {
 	res[2] = a[0] * b[1] - a[1] * b[0];
 }
 
-void POT_deriv(	const					m_minus_forces* minus_forces,
-				const					rigid_cl*		lig_rigid_gpu,
-				const					m_coords_cl*		m_coords,
+void POT_deriv(	const	__global				m_ro_cl* restrict m,
+										__global float* m_soa_buffer,
+										int thread_id,
+										int total_threads,
 										change_cl*		g
 ) {
-	int num_torsion = lig_rigid_gpu->num_children;
+	int num_torsion = m->ligand.rigid.num_children;
 	int num_rigid = num_torsion + 1;
 	float position_derivative_tmp[MAX_NUM_OF_RIGID][3];
 	float position_derivative[MAX_NUM_OF_RIGID][3];
@@ -446,19 +475,26 @@ void POT_deriv(	const					m_minus_forces* minus_forces,
 	float torsion_derivative[MAX_NUM_OF_RIGID]; // torsion_derivative[0] has no meaning(root node has no torsion)
 
 	for (int i = 0; i < num_rigid; i++) {
-		int begin = lig_rigid_gpu->atom_range[i][0];
-		int end = lig_rigid_gpu->atom_range[i][1];
+		int begin = m->ligand.rigid.atom_range[i][0];
+		int end = m->ligand.rigid.atom_range[i][1];
 		for (int k = 0; k < 3; k++)position_derivative_tmp[i][k] = 0; 
 		for (int k = 0; k < 3; k++)orientation_derivative_tmp[i][k] = 0;
+		
+		float origin_i[3] = {m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, i, 0, 3, thread_id, total_threads)],
+							 m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, i, 1, 3, thread_id, total_threads)],
+							 m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, i, 2, 3, thread_id, total_threads)]};
+							 
 		for (int j = begin; j < end; j++) {
-			for (int k = 0; k < 3; k++)position_derivative_tmp[i][k] += minus_forces->coords[j][k];
+			float mf[3] = {m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, j, 0, 3, thread_id, total_threads)],
+						   m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, j, 1, 3, thread_id, total_threads)],
+						   m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, j, 2, 3, thread_id, total_threads)]};
+						   
+			for (int k = 0; k < 3; k++)position_derivative_tmp[i][k] += mf[k];
 
-			float tmp1[3] = {	m_coords->coords[j][0] - lig_rigid_gpu->origin[i][0],
-								m_coords->coords[j][1] - lig_rigid_gpu->origin[i][1],
-								m_coords->coords[j][2] - lig_rigid_gpu->origin[i][2] };
-			float tmp2[3] = {  minus_forces->coords[j][0],
-								minus_forces->coords[j][1],
-								minus_forces->coords[j][2] };
+			float tmp1[3] = {	m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, j, 0, 3, thread_id, total_threads)] - origin_i[0],
+								m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, j, 1, 3, thread_id, total_threads)] - origin_i[1],
+								m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, j, 2, 3, thread_id, total_threads)] - origin_i[2] };
+			float tmp2[3] = { mf[0], mf[1], mf[2] };
 			float tmp3[3];
 			product(tmp3, tmp1, tmp2);
 			for (int k = 0; k < 3; k++)orientation_derivative_tmp[i][k] += tmp3[k];
@@ -470,7 +506,7 @@ void POT_deriv(	const					m_minus_forces* minus_forces,
 		for (int k = 0; k < 3; k++)position_derivative[i][k] = position_derivative_tmp[i][k]; // self
 		// looking for chidren node
 		for (int j = 0; j < num_rigid; j++) {
-			if (lig_rigid_gpu->children_map[i][j] == true) {
+			if (m->ligand.rigid.children_map[i][j] == true) {
 				for (int k = 0; k < 3; k++)position_derivative[i][k] += position_derivative[j][k]; // self+children node
 			}
 		}
@@ -481,12 +517,18 @@ void POT_deriv(	const					m_minus_forces* minus_forces,
 		for (int k = 0; k < 3; k++)orientation_derivative[i][k] = orientation_derivative_tmp[i][k]; // self
 		// looking for chidren node
 		for (int j = 0; j < num_rigid; j++) {
-			if (lig_rigid_gpu->children_map[i][j] == true) { // self + children node + product
+			if (m->ligand.rigid.children_map[i][j] == true) { // self + children node + product
 				for (int k = 0; k < 3; k++)orientation_derivative[i][k] += orientation_derivative[j][k];
 				float product_out[3];
-				float origin_temp[3] = {	lig_rigid_gpu->origin[j][0] - lig_rigid_gpu->origin[i][0],
-											lig_rigid_gpu->origin[j][1] - lig_rigid_gpu->origin[i][1],
-											lig_rigid_gpu->origin[j][2] - lig_rigid_gpu->origin[i][2] };
+				float origin_i[3] = {m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, i, 0, 3, thread_id, total_threads)],
+									 m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, i, 1, 3, thread_id, total_threads)],
+									 m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, i, 2, 3, thread_id, total_threads)]};
+				float origin_j[3] = {m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, j, 0, 3, thread_id, total_threads)],
+									 m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, j, 1, 3, thread_id, total_threads)],
+									 m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, j, 2, 3, thread_id, total_threads)]};
+				float origin_temp[3] = {	origin_j[0] - origin_i[0],
+											origin_j[1] - origin_i[1],
+											origin_j[2] - origin_i[2] };
 				product(product_out, origin_temp, position_derivative[j]);
 				for (int k = 0; k < 3; k++)orientation_derivative[i][k] += product_out[k];
 			}
@@ -496,7 +538,10 @@ void POT_deriv(	const					m_minus_forces* minus_forces,
 	// torsion_derivative
 	for (int i = num_rigid - 1; i >= 0; i--) { // from bottom to top
 		float sum = 0;
-		for (int j = 0; j < 3; j++) sum += orientation_derivative[i][j] * lig_rigid_gpu->axis[i][j];
+		float axis_i[3] = {m_soa_buffer[SOA_IDX(AXIS_OFFSET, i, 0, 3, thread_id, total_threads)],
+						   m_soa_buffer[SOA_IDX(AXIS_OFFSET, i, 1, 3, thread_id, total_threads)],
+						   m_soa_buffer[SOA_IDX(AXIS_OFFSET, i, 2, 3, thread_id, total_threads)]};
+		for (int j = 0; j < 3; j++) sum += orientation_derivative[i][j] * axis_i[j];
 		torsion_derivative[i] = sum;
 	}
 
@@ -508,31 +553,34 @@ void POT_deriv(	const					m_minus_forces* minus_forces,
 
 float m_eval_deriv(						output_type_cl*		c,
 										change_cl*			g,
-										m_cl*				m,
+							const	__global	m_ro_cl* restrict	m,
+										__global float* m_soa_buffer,
+										int thread_id,
+										int total_threads,
 							__constant	pre_cl*				pre,
 							__constant	grids_cl*			grids,
 					const	__global	float*				v,
 					const				float				epsilon_fl
 ) {
-	set(c, &m->ligand.rigid, &m->m_coords, m->atoms, m->m_num_movable_atoms, epsilon_fl);
+	set(c, m, m_soa_buffer, thread_id, total_threads, epsilon_fl);
 
 	float e = ig_eval_deriv(	c,
 								g, 
 								v[1],				
 								grids,
 								m,
+								m_soa_buffer, thread_id, total_threads,
 								epsilon_fl							
 							);
 	
 	e += eval_interacting_pairs_deriv(	pre,
 										v[0],
 										&m->ligand.pairs,
-										&m->m_coords,
-										&m->minus_forces,
+										m_soa_buffer, thread_id, total_threads,
 										epsilon_fl
 									);
 
-	POT_deriv(&m->minus_forces, &m->ligand.rigid, &m->m_coords, g);
+	POT_deriv(m, m_soa_buffer, thread_id, total_threads, g);
 
 	return e;
 }
@@ -613,7 +661,11 @@ inline float to_norm(const change_cl* in, const int n, const int torsion_size)
 }
 
 
-inline int line_search_lewisoverton(					m_cl* 			m_cl_gpu,
+inline int line_search_lewisoverton(					
+							const	__global	m_ro_cl* restrict	m_cl_gpu,
+										__global float* m_soa_buffer,
+										int thread_id,
+										int total_threads,
 											__constant 	pre_cl* 		p_cl_gpu,
 											__constant 	grids_cl* 		ig_cl_gpu,
 														int 			n,
@@ -656,7 +708,7 @@ inline int line_search_lewisoverton(					m_cl* 			m_cl_gpu,
 		/* Evaluate the function and gradient values. */
 		*f = m_eval_deriv(x,
 			g,
-			m_cl_gpu,
+			m_cl_gpu, m_soa_buffer, thread_id, total_threads,
 			p_cl_gpu,
 			ig_cl_gpu,
 			hunt_cap,
@@ -699,7 +751,11 @@ inline int line_search_lewisoverton(					m_cl* 			m_cl_gpu,
 	}
 }
 
-float line_search(					 	m_cl*				m,
+float line_search(					 	
+							const	__global	m_ro_cl* restrict	m,
+										__global float* m_soa_buffer,
+										int thread_id,
+										int total_threads,
 							__constant	pre_cl*				pre,
 							__constant	grids_cl*			grids,
 										int					n,
@@ -729,7 +785,7 @@ float line_search(					 	m_cl*				m,
 
 		*f1 =  m_eval_deriv(x_new,
 							g_new,
-							m,
+							m, m_soa_buffer, thread_id, total_threads,
 							pre,
 							grids,
 							hunt_cap,
@@ -782,7 +838,10 @@ bool bfgs_update(			matrix*			h,
 
 void rilc_bfgs(				output_type_cl* 	x,
 						change_cl* 			g,
-						m_cl* 				m_cl_gpu,
+						const	__global	m_ro_cl* restrict	m_cl_gpu,
+										__global float* m_soa_buffer,
+										int thread_id,
+										int total_threads,
 			__constant	pre_cl* 			p_cl_gpu,
 			__constant	grids_cl* 			ig_cl_gpu,
 	const	__global	mis_cl*				mis,
@@ -810,7 +869,7 @@ void rilc_bfgs(				output_type_cl* 	x,
 	float lm_ys = 0;
 	fx = m_eval_deriv(	x,
 						g,
-						m_cl_gpu,
+						m_cl_gpu, m_soa_buffer, thread_id, total_threads,
 						p_cl_gpu,
 						ig_cl_gpu,
 						mis->hunt_cap,
@@ -844,7 +903,7 @@ void rilc_bfgs(				output_type_cl* 	x,
 			fxp = fx;
 
 
-			ls = line_search_lewisoverton(m_cl_gpu,
+			ls = line_search_lewisoverton(m_cl_gpu, m_soa_buffer, thread_id, total_threads,
 				p_cl_gpu,
 				ig_cl_gpu,
 				n,
@@ -969,7 +1028,10 @@ void rilc_bfgs(				output_type_cl* 	x,
 
 void bfgs(					output_type_cl*			x,
 								change_cl*			g,
-								m_cl*				m,
+							const	__global	m_ro_cl* restrict	m,
+										__global float* m_soa_buffer,
+										int thread_id,
+										int total_threads,
 					__constant	pre_cl*				pre,
 					__constant	grids_cl*			grids,
 			const	__global	mis_cl*				mis,
@@ -989,7 +1051,7 @@ void bfgs(					output_type_cl*			x,
 	output_type_cl x_new = *x ;
 	float f0 = m_eval_deriv(	x,
 								g,
-								m,
+								m, m_soa_buffer, thread_id, total_threads,
 								pre,
 								grids,
 								mis->hunt_cap,
@@ -1008,7 +1070,7 @@ void bfgs(					output_type_cl*			x,
 		minus_mat_vec_product(&h, g, &p, torsion_size);
 		float f1 = 0;
 
-		const float alpha = line_search(	m,
+		const float alpha = line_search(	m, m_soa_buffer, thread_id, total_threads,
 											pre,
 											grids,
 											n,

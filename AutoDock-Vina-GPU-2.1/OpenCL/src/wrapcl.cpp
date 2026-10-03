@@ -542,8 +542,7 @@ cl_program SetupBuildProgramWithBinary(cl_context context, cl_device_id device, 
     // Load the binary file
     FILE* program_handle = fopen(binary_file_name, "r");
     if (!program_handle) {
-        printf("\nError: Could not open binary file: %s", binary_file_name);
-        exit(-1);
+        throw std::runtime_error("Could not open binary file: " + std::string(binary_file_name));
     }
     fseek(program_handle, 0, SEEK_END);
     size_t program_size = ftell(program_handle);

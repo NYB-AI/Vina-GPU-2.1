@@ -105,15 +105,16 @@ const float vec_distance_sqr(const float* a, const float* b) {
 
 float gyration_radius(				int				m_lig_begin,
 									int				m_lig_end,
-						const		atom_cl*		atoms,
-						const		m_coords_cl*	m_coords_gpu,
-						const		float*			m_lig_node_origin
+						const		__global atom_cl*		atoms,
+									__global float* m_soa_buffer,
+									int thread_id,
+									int total_threads
 ) {
 	float acc = 0;
 	int counter = 0;
-	float origin[3] = { m_lig_node_origin[0], m_lig_node_origin[1], m_lig_node_origin[2] };
+	float origin[3] = { m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, 0, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, 1, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(ORIGIN_OFFSET, 0, 2, 3, thread_id, total_threads)] };
 	for (int i = m_lig_begin; i < m_lig_end; i++) {
-		float current_coords[3] = { m_coords_gpu->coords[i][0], m_coords_gpu->coords[i][1], m_coords_gpu->coords[i][2] };
+		float current_coords[3] = { m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 0, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 1, 3, thread_id, total_threads)], m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 2, 3, thread_id, total_threads)] };
 		if (atoms[i].types[0] != EL_TYPE_H) { // for el, we use the first element (atoms[i].types[0])
 			acc += vec_distance_sqr(current_coords, origin);
 			++counter;
@@ -129,9 +130,10 @@ void mutate_conf_cl(const					int				step,
 							__constant		float*			random_fl_pi_map,
 					const					int				m_lig_begin,
 					const					int				m_lig_end,
-					const					atom_cl*		atoms,
-					const					m_coords_cl*	m_coords_gpu,
-					const					float*			m_lig_node_origin_gpu,
+					const					__global atom_cl*		atoms,
+											__global float* m_soa_buffer,
+											int thread_id,
+											int total_threads,
 					const					float			epsilon_fl,
 					const					float			amplitude,
 					const					int				lig_torsion_size
@@ -147,7 +149,7 @@ void mutate_conf_cl(const					int				step,
 		}
 		--which;
 		if (which == 0) {
-			float gr = gyration_radius(m_lig_begin, m_lig_end, atoms, m_coords_gpu, m_lig_node_origin_gpu);
+			float gr = gyration_radius(m_lig_begin, m_lig_end, atoms, m_soa_buffer, thread_id, total_threads);
 			if (gr > epsilon_fl) {
 				float rotation[3];
 				for (int i = 0; i < 3; i++)rotation[i] = amplitude / gr * random_inside_sphere_map[index][i];

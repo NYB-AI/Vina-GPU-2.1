@@ -427,6 +427,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	
 
 	for (int ligand_count = 0; ligand_count < num_ligands; ligand_count++) {
+		generator.seed(static_cast<rng::result_type>(seed));
 # ifndef NDEBUG
 		printf("\nDocking ligand: %s", ligand_names[ligand_count][0].c_str());
 # endif

@@ -102,18 +102,15 @@ typedef struct { // depth-first order
 	int		num_children;
 	bool	children_map	[MAX_NUM_OF_RIGID][MAX_NUM_OF_RIGID]; // chidren_map[i][j] = true if node i's child is node j
 	int		parent			[MAX_NUM_OF_RIGID]; // every node has only 1 parent node
-	
+
 	int		atom_range		[MAX_NUM_OF_RIGID][2];
-	float	origin			[MAX_NUM_OF_RIGID][3];
-	float	orientation_m	[MAX_NUM_OF_RIGID][9]; // This matrix is fixed to 3*3
-	float	orientation_q	[MAX_NUM_OF_RIGID][4];
-	
-	float	axis			[MAX_NUM_OF_RIGID][3]; // 1st column is root node, all 0s
-	float	relative_axis	[MAX_NUM_OF_RIGID][3]; // 1st column is root node, all 0s
-	float	relative_origin	[MAX_NUM_OF_RIGID][3]; // 1st column is root node, all 0s
-	
-	
-} rigid_cl;
+	// Hoisted from per-thread SoA buffer: these are read-only ligand topology
+	// (set once at host-side init, never written by the kernel) so they belong
+	// in m_ro_cl, not in the per-thread mutable buffer. Saves ~9 MB/ligand at
+	// par.mc.thread = 8000.
+	float	relative_axis	[MAX_NUM_OF_RIGID][3];
+	float	relative_origin	[MAX_NUM_OF_RIGID][3];
+} rigid_ro_cl;
 
 typedef struct {
 	int num_pairs;
@@ -126,8 +123,8 @@ typedef struct {
 	int begin;
 	int end;
 	lig_pairs_cl pairs;
-	rigid_cl rigid;
-} ligand_cl;
+	rigid_ro_cl rigid;
+} ligand_ro_cl;
 
 typedef struct {
 	int		int_map		[MAX_NUM_OF_RANDOM_MAP];
@@ -138,10 +135,30 @@ typedef struct {
 typedef struct {
 	int m_num_movable_atoms;
 	atom_cl atoms[MAX_NUM_OF_ATOMS];
-	m_coords_cl m_coords;
-	m_minus_forces minus_forces;
-	ligand_cl ligand;
-} m_cl;
+	ligand_ro_cl ligand;
+} m_ro_cl;
+
+#define M_COORDS_DIM (MAX_NUM_OF_ATOMS * 3)
+#define MINUS_FORCES_DIM (MAX_NUM_OF_ATOMS * 3)
+#define ORIGIN_DIM (MAX_NUM_OF_RIGID * 3)
+#define ORIENTATION_M_DIM (MAX_NUM_OF_RIGID * 9)
+#define ORIENTATION_Q_DIM (MAX_NUM_OF_RIGID * 4)
+#define AXIS_DIM (MAX_NUM_OF_RIGID * 3)
+
+#define M_COORDS_OFFSET 0
+#define MINUS_FORCES_OFFSET (M_COORDS_OFFSET + M_COORDS_DIM)
+#define ORIGIN_OFFSET (MINUS_FORCES_OFFSET + MINUS_FORCES_DIM)
+#define ORIENTATION_M_OFFSET (ORIGIN_OFFSET + ORIGIN_DIM)
+#define ORIENTATION_Q_OFFSET (ORIENTATION_M_OFFSET + ORIENTATION_M_DIM)
+#define AXIS_OFFSET (ORIENTATION_Q_OFFSET + ORIENTATION_Q_DIM)
+
+// RELATIVE_AXIS / RELATIVE_ORIGIN moved out of the SoA mutable buffer into
+// m_ro_cl (rigid_ro_cl.relative_axis / .relative_origin). They are read-only
+// ligand topology, so storing them per-thread was wasted VRAM.
+#define TOTAL_MUTABLE_DIM (AXIS_OFFSET + AXIS_DIM)
+
+#define SOA_IDX(offset, i, j, dim_j, thread_id, total_threads) \
+    (((offset) + (i) * (dim_j) + (j)) * (total_threads) + (thread_id))
 
 typedef struct {
 	int m_i;

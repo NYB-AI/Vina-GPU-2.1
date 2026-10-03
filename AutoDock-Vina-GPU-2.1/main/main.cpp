@@ -25,6 +25,8 @@
 #include <exception>
 #include <vector> // ligand paths
 #include <cmath> // for ceila
+#include <cstdlib> // getenv for VINA_GPU_LOG
+#include <unistd.h> // getpid for per-process log
 #include <boost/program_options.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/exception.hpp>
@@ -895,11 +897,16 @@ Thank you!\n";
 	clock_t end = clock();
 
 #ifdef TIME_ANALYSIS
-	std::ofstream file("gpu_runtime.log", std::ios::app);
-	if (file.is_open())
 	{
-		file << "AutoDockVina-GPU3 total runtime = " << (double)(end - start) / CLOCKS_PER_SEC << " s" << std::endl;
-		file.close();
+		const char* log_env = std::getenv("VINA_GPU_LOG");
+		std::string log_path = log_env ? std::string(log_env)
+		                               : ("gpu_runtime.log." + std::to_string(getpid()));
+		std::ofstream file(log_path, std::ios::app);
+		if (file.is_open())
+		{
+			file << "AutoDockVina-GPU3 total runtime = " << (double)(end - start) / CLOCKS_PER_SEC << " s" << std::endl;
+			file.close();
+		}
 	}
 #endif
 

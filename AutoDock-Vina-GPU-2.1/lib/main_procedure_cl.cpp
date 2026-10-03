@@ -17,6 +17,16 @@
 #include <stdexcept>
 #include <iomanip>
 #include <stdio.h>
+#include <cstdlib>
+#include <unistd.h>
+
+namespace {
+inline std::string vina_gpu_log_path() {
+	const char* env = std::getenv("VINA_GPU_LOG");
+	if (env) return std::string(env);
+	return std::string("gpu_runtime.log.") + std::to_string(getpid());
+}
+}
 
 using namespace std;
 volatile enum { FINISH, DOCKING, ABORT} status;
@@ -402,7 +412,18 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	//mis_ptr->max_bfgs_steps = quasi_newton_par_max_steps;
 	//mis_ptr->search_depth = par.mc.search_depth;
 	mis_ptr->mutation_amplitude = par.mc.mutation_amplitude;
-	mis_ptr->total_wi = max_wi_size[0] * max_wi_size[1];
+	// Right-size kernel2 launch to actual replica count, rounded up to a
+	// warp-multiple (32). Old code launched a fixed grid sized to device max
+	// regardless of par.mc.thread, which wasted SM occupancy on small jobs and
+	// made multi-process co-execution unnecessarily expensive. The kernel's
+	// gll stride loop already handles thread > total_wi correctly, so any
+	// total_wi >= 32 is valid.
+	{
+		const int wg = 32;
+		int wi = ((par.mc.thread + wg - 1) / wg) * wg;
+		if (wi < wg) wi = wg;
+		mis_ptr->total_wi = wi;
+	}
 	mis_ptr->thread = par.mc.thread;
 	mis_ptr->ar_mi = ig.m_data.m_i;
 	mis_ptr->ar_mj = ig.m_data.m_j;
@@ -483,16 +504,32 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 /**************************************************************************/
 /************************    Kernel2    ***********************/
 /**************************************************************************/
+	// --- Pinned host buffers for kernel2 outputs (Tier 1d).
+	// Allocate once outside the per-ligand loop since par.mc.thread is fixed.
+	// Using CL_MEM_ALLOC_HOST_PTR + clEnqueueMapBuffer gives DMA-capable host
+	// memory so clEnqueueReadBuffer below avoids an extra staging-buffer copy.
+	const size_t pinned_results_bytes = par.mc.thread * sizeof(output_type_cl);
+	const size_t pinned_coords_bytes  = par.mc.thread * sizeof(ligand_atom_coords_cl);
+	cl_mem pinned_results_buf = clCreateBuffer(context, CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_WRITE,
+		pinned_results_bytes, NULL, &err); checkErr(err);
+	cl_mem pinned_coords_buf  = clCreateBuffer(context, CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_WRITE,
+		pinned_coords_bytes, NULL, &err); checkErr(err);
+	output_type_cl* pinned_results_host = (output_type_cl*)clEnqueueMapBuffer(queue, pinned_results_buf,
+		CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, pinned_results_bytes, 0, NULL, NULL, &err); checkErr(err);
+	ligand_atom_coords_cl* pinned_coords_host = (ligand_atom_coords_cl*)clEnqueueMapBuffer(queue, pinned_coords_buf,
+		CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, pinned_coords_bytes, 0, NULL, NULL, &err); checkErr(err);
+
 	int num_ligands = ms.size();
 	std::vector<random_maps*>			rand_maps_ptrs		(num_ligands);
 	std::vector<output_type_cl*>		ric_ptrs			(num_ligands);
-	std::vector<m_cl*>					m_ptrs				(num_ligands);
+	std::vector<m_ro_cl*>					m_ptrs				(num_ligands);
 	std::vector<ligand_atom_coords_cl*> result_coords_ptrs	(num_ligands);
 	std::vector<output_type_cl*>		result_ptrs			(num_ligands);
 	std::vector<int>					torsion_sizes		(num_ligands);
 
 	std::vector<cl_mem> ric_gpus			(num_ligands);
 	std::vector<cl_mem> m_gpus				(num_ligands);
+	std::vector<cl_mem> m_soa_gpus			(num_ligands);
 	std::vector<cl_mem> random_maps_gpus	(num_ligands);
 	std::vector<cl_mem> result_coords_gpus	(num_ligands);
 	std::vector<cl_mem> result_gpus			(num_ligands);
@@ -501,6 +538,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 
 
 	for (int ligand_count = 0; ligand_count < num_ligands; ligand_count++) {
+		generator.seed(static_cast<rng::result_type>(seed));
 # ifndef NDEBUG
 		printf("\nDocking ligand: %s\n", ligand_names[ligand_count][0].c_str());
 # endif
@@ -544,11 +582,11 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 		size_t ric_size = par.mc.thread * sizeof(output_type_cl);
 
 		// Preparing m related data
-		m_ptrs[ligand_count] = (m_cl*)malloc(sizeof(m_cl));
-		m_cl* m_ptr = m_ptrs[ligand_count];
+		m_ptrs[ligand_count] = (m_ro_cl*)malloc(sizeof(m_ro_cl));
+		m_ro_cl* m_ptr = m_ptrs[ligand_count];
 
-
-		
+		size_t soa_size = TOTAL_MUTABLE_DIM * par.mc.thread * sizeof(float);
+		float* soa_ptr = (float*)malloc(soa_size);
 
 		for (int i = 0; i < m.atoms.size(); i++) {
 			m_ptr->atoms[i].types[0] = m.atoms[i].el;// To store 4 atoms types (el, ad, xs, sy)
@@ -560,17 +598,19 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 			}
 		}
 
-		// To store atoms coords
-		for (int i = 0; i < m.coords.size(); i++) {
-			for (int j = 0; j < 3; j++) {
-				m_ptr->m_coords.coords[i][j] = m.coords[i].data[j];
+		for (int t = 0; t < par.mc.thread; t++) {
+			// To store atoms coords
+			for (int i = 0; i < m.coords.size(); i++) {
+				for (int j = 0; j < 3; j++) {
+					soa_ptr[SOA_IDX(M_COORDS_OFFSET, i, j, 3, t, par.mc.thread)] = m.coords[i].data[j];
+				}
 			}
-		}
 
-		//To store minus forces
-		for (int i = 0; i < m.coords.size(); i++) {
-			for (int j = 0; j < 3; j++) {
-				m_ptr->minus_forces.coords[i][j] = m.minus_forces[i].data[j];
+			//To store minus forces
+			for (int i = 0; i < m.coords.size(); i++) {
+				for (int j = 0; j < 3; j++) {
+					soa_ptr[SOA_IDX(MINUS_FORCES_OFFSET, i, j, 3, t, par.mc.thread)] = m.minus_forces[i].data[j];
+				}
 			}
 		}
 
@@ -594,33 +634,49 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 		// Store root node
 		m_ptr->ligand.rigid.atom_range[0][0] = m_ligand.node.begin;
 		m_ptr->ligand.rigid.atom_range[0][1] = m_ligand.node.end;
-		for (int i = 0; i < 3; i++) m_ptr->ligand.rigid.origin[0][i] = m_ligand.node.get_origin()[i];
-		for (int i = 0; i < 9; i++) m_ptr->ligand.rigid.orientation_m[0][i] = m_ligand.node.get_orientation_m().data[i];
-		m_ptr->ligand.rigid.orientation_q[0][0] = m_ligand.node.orientation().R_component_1();
-		m_ptr->ligand.rigid.orientation_q[0][1] = m_ligand.node.orientation().R_component_2();
-		m_ptr->ligand.rigid.orientation_q[0][2] = m_ligand.node.orientation().R_component_3();
-		m_ptr->ligand.rigid.orientation_q[0][3] = m_ligand.node.orientation().R_component_4();
-		for (int i = 0; i < 3; i++) { m_ptr->ligand.rigid.axis[0][i] = 0; m_ptr->ligand.rigid.relative_axis[0][i] = 0; m_ptr->ligand.rigid.relative_origin[0][i] = 0; }
+		// Root node has no parent, so its relative_axis/origin are unused by
+		// the kernel (which only iterates current >= 1). Zero-initialize for
+		// hygiene.
+		for (int i = 0; i < 3; i++) {
+			m_ptr->ligand.rigid.relative_axis[0][i] = 0;
+			m_ptr->ligand.rigid.relative_origin[0][i] = 0;
+		}
+		for (int t = 0; t < par.mc.thread; t++) {
+			for (int i = 0; i < 3; i++) soa_ptr[SOA_IDX(ORIGIN_OFFSET, 0, i, 3, t, par.mc.thread)] = m_ligand.node.get_origin()[i];
+			for (int i = 0; i < 9; i++) soa_ptr[SOA_IDX(ORIENTATION_M_OFFSET, 0, i, 9, t, par.mc.thread)] = m_ligand.node.get_orientation_m().data[i];
+			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 0, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_1();
+			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 1, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_2();
+			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 2, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_3();
+			soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, 0, 3, 4, t, par.mc.thread)] = m_ligand.node.orientation().R_component_4();
+			for (int i = 0; i < 3; i++) {
+				soa_ptr[SOA_IDX(AXIS_OFFSET, 0, i, 3, t, par.mc.thread)] = 0;
+			}
+		}
 
-		// Store children nodes (in depth-first order)
 		struct tmp_struct {
 			int start_index = 0;
 			int parent_index = 0;
-			void store_node(tree<segment>& child_ptr, rigid_cl& rigid) {
+			void store_node(tree<segment>& child_ptr, rigid_ro_cl& rigid, float* soa_ptr, int thread_count) {
 				start_index++; // start with index 1, index 0 is root node
 				rigid.parent[start_index] = parent_index;
 				rigid.atom_range[start_index][0] = child_ptr.node.begin;
 				rigid.atom_range[start_index][1] = child_ptr.node.end;
-				for (int i = 0; i < 9; i++) rigid.orientation_m[start_index][i] = child_ptr.node.get_orientation_m().data[i];
-				rigid.orientation_q[start_index][0] = child_ptr.node.orientation().R_component_1();
-				rigid.orientation_q[start_index][1] = child_ptr.node.orientation().R_component_2();
-				rigid.orientation_q[start_index][2] = child_ptr.node.orientation().R_component_3();
-				rigid.orientation_q[start_index][3] = child_ptr.node.orientation().R_component_4();
+				// relative_axis / relative_origin are read-only ligand topology;
+				// store once in m_ro_cl rather than per-thread in soa_ptr.
 				for (int i = 0; i < 3; i++) {
-					rigid.origin[start_index][i] = child_ptr.node.get_origin()[i];
-					rigid.axis[start_index][i] = child_ptr.node.get_axis()[i];
 					rigid.relative_axis[start_index][i] = child_ptr.node.relative_axis[i];
 					rigid.relative_origin[start_index][i] = child_ptr.node.relative_origin[i];
+				}
+				for (int t = 0; t < thread_count; t++) {
+					for (int i = 0; i < 9; i++) soa_ptr[SOA_IDX(ORIENTATION_M_OFFSET, start_index, i, 9, t, thread_count)] = child_ptr.node.get_orientation_m().data[i];
+					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 0, 4, t, thread_count)] = child_ptr.node.orientation().R_component_1();
+					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 1, 4, t, thread_count)] = child_ptr.node.orientation().R_component_2();
+					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 2, 4, t, thread_count)] = child_ptr.node.orientation().R_component_3();
+					soa_ptr[SOA_IDX(ORIENTATION_Q_OFFSET, start_index, 3, 4, t, thread_count)] = child_ptr.node.orientation().R_component_4();
+					for (int i = 0; i < 3; i++) {
+						soa_ptr[SOA_IDX(ORIGIN_OFFSET, start_index, i, 3, t, thread_count)] = child_ptr.node.get_origin()[i];
+						soa_ptr[SOA_IDX(AXIS_OFFSET, start_index, i, 3, t, thread_count)] = child_ptr.node.get_axis()[i];
+					}
 				}
 				if (child_ptr.children.size() == 0) return;
 				else {
@@ -628,7 +684,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 					int parent_index_tmp = start_index;
 					for (int i = 0; i < child_ptr.children.size(); i++) {
 						this->parent_index = parent_index_tmp; // Update parent index
-						this->store_node(child_ptr.children[i], rigid);
+						this->store_node(child_ptr.children[i], rigid, soa_ptr, thread_count);
 					}
 				}
 			}
@@ -636,7 +692,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 		tmp_struct ts;
  		for (int i = 0; i < m_ligand.children.size(); i++) {
 			ts.parent_index = 0; // Start a new branch, whose parent is 0
-			ts.store_node(m_ligand.children[i], m_ptr->ligand.rigid);
+			ts.store_node(m_ligand.children[i], m_ptr->ligand.rigid, soa_ptr, par.mc.thread);
 		}
 		m_ptr->ligand.rigid.num_children = ts.start_index;
 
@@ -649,21 +705,24 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 			m_ptr->ligand.rigid.children_map[parent_index][i] = true;
 		}
 		m_ptr->m_num_movable_atoms = m.num_movable_atoms();
-		size_t m_size = sizeof(m_cl);
+		size_t m_size = sizeof(m_ro_cl);
 
-		// Init ligand atom coords
-		result_coords_ptrs[ligand_count] = (ligand_atom_coords_cl*)malloc(par.mc.thread * sizeof(ligand_atom_coords_cl));
-
-		// Init results
-		result_ptrs[ligand_count] = (output_type_cl*)malloc(par.mc.thread * sizeof(output_type_cl));
+		// Use shared pinned host buffers (allocated once before loop) instead of
+		// per-ligand malloc. Ligands process sequentially so reusing the same
+		// buffer is safe.
+		result_coords_ptrs[ligand_count] = pinned_coords_host;
+		result_ptrs[ligand_count]        = pinned_results_host;
 
 		//cl_mem ric_gpu;
 		CreateDeviceBuffer(&ric_gpus[ligand_count], CL_MEM_READ_ONLY, ric_size, context);
 		err = clEnqueueWriteBuffer(queue, ric_gpus[ligand_count], false, 0, ric_size, ric_ptr, 0, NULL, NULL); checkErr(err);
 
 		//cl_mem m_gpu;
-		CreateDeviceBuffer(&m_gpus[ligand_count], CL_MEM_READ_WRITE, m_size, context);
+		CreateDeviceBuffer(&m_gpus[ligand_count], CL_MEM_READ_ONLY, m_size, context);
 		err = clEnqueueWriteBuffer(queue, m_gpus[ligand_count], false, 0, m_size, m_ptr, 0, NULL, NULL); checkErr(err);
+
+		CreateDeviceBuffer(&m_soa_gpus[ligand_count], CL_MEM_READ_WRITE, soa_size, context);
+		err = clEnqueueWriteBuffer(queue, m_soa_gpus[ligand_count], false, 0, soa_size, soa_ptr, 0, NULL, NULL); checkErr(err);
 
 
 		//cl_mem random_maps_gpu;
@@ -694,11 +753,15 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 		SetKernelArg(kernels[1], 9, sizeof(int),	&par.mc.search_depth[ligand_count]);
 		SetKernelArg(kernels[1], 10, sizeof(int),	&par.mc.ssd_par.bfgs_steps[ligand_count]);
 		SetKernelArg(kernels[1], 11, sizeof(int),	&rilc_bfgs);
+		SetKernelArg(kernels[1], 12, sizeof(cl_mem), &m_soa_gpus[ligand_count]);
 
-		size_t kernel2_global_size[2] = { 512, 32 };
-		size_t kernel2_local_size[2] = { 16,2 };
+		// 1D launch sized to mis_ptr->total_wi (set above to ceil(thread/32)*32).
+		// kernel2 only uses get_global_linear_id(), so dimensionality doesn't
+		// matter; gx/gy/gs at the top of kernel2 are dead.
+		size_t kernel2_global_size = mis_ptr->total_wi;
+		size_t kernel2_local_size = 32;
 
-		err = clEnqueueNDRangeKernel(queue, kernels[1], 2, 0, kernel2_global_size, kernel2_local_size,
+		err = clEnqueueNDRangeKernel(queue, kernels[1], 1, 0, &kernel2_global_size, &kernel2_local_size,
 			0, NULL, &ligands_events[ligand_count]); checkErr(err);
 
 		clWaitForEvents(1, &ligands_events[ligand_count]);
@@ -733,14 +796,16 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 		free(rand_maps_ptrs[ligand_count]);
 		free(ric_ptrs[ligand_count]);
 		free(m_ptrs[ligand_count]);
-		free(result_coords_ptrs[ligand_count]);
-		free(result_ptrs[ligand_count]);
+		free(soa_ptr);
+		// result_coords_ptrs and result_ptrs point into shared pinned buffers
+		// (cleaned up after the ligand loop); do not free them here.
 
 
 		err = clReleaseMemObject(result_coords_gpus[ligand_count]); checkErr(err);
 		err = clReleaseMemObject(result_gpus[ligand_count]);		checkErr(err);
 		err = clReleaseMemObject(ric_gpus[ligand_count]);			checkErr(err);
 		err = clReleaseMemObject(m_gpus[ligand_count]);				checkErr(err);
+		err = clReleaseMemObject(m_soa_gpus[ligand_count]);			checkErr(err);
 		err = clReleaseMemObject(random_maps_gpus[ligand_count]);	checkErr(err);
 		
 #ifndef TIME_ANALYSIS
@@ -755,6 +820,13 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	}
 	}
 
+	// Tear down pinned host buffers (Tier 1d).
+	err = clEnqueueUnmapMemObject(queue, pinned_results_buf, pinned_results_host, 0, NULL, NULL); checkErr(err);
+	err = clEnqueueUnmapMemObject(queue, pinned_coords_buf,  pinned_coords_host,  0, NULL, NULL); checkErr(err);
+	clFinish(queue);
+	err = clReleaseMemObject(pinned_results_buf); checkErr(err);
+	err = clReleaseMemObject(pinned_coords_buf);  checkErr(err);
+
 	free(mis_ptr);
 	err = clReleaseMemObject(mis_gpu);		checkErr(err);
 	err = clReleaseMemObject(grids_gpu);	checkErr(err);
@@ -768,7 +840,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	// Output Analysis
 	cl_ulong time_start, time_end;
 	double total_time = 0;
-	std::string log_file = "gpu_runtime.log";
+	std::string log_file = vina_gpu_log_path();
 	// delete file if file exists
 	if (std::ifstream(log_file)) {
 		std::remove(log_file.c_str());
@@ -793,7 +865,7 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 #endif
 #ifdef OPENCL_TIME_ANALYSIS
 		cout << setiosflags(ios::fixed);
-		std::ofstream file("gpu_runtime.log");
+		std::ofstream file(vina_gpu_log_path());
 		if (file.is_open())
 		{
 			file << "GPU grid cache runtime = " << (kernel1_total_time / 1000000000.0) << " s" << std::endl;

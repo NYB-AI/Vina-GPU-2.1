@@ -1,8 +1,8 @@
-void get_heavy_atom_movable_coords(output_type_cl* tmp, const m_cl* m, ligand_atom_coords_cl* coords) {
+void get_heavy_atom_movable_coords(output_type_cl* tmp, const __global m_ro_cl* restrict m, __global float* m_soa_buffer, int thread_id, int total_threads, __global ligand_atom_coords_cl* coords) {
 	int counter = 0;
 	for (int i = 0; i < m->m_num_movable_atoms; i++) {
 		if (m->atoms[i].types[0] != EL_TYPE_H) {
-			for (int j = 0; j < 3; j++)coords->coords[counter][j] = m->m_coords.coords[i][j];
+			for (int j = 0; j < 3; j++)coords->coords[counter][j] = m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, j, 3, thread_id, total_threads)];
 			counter++;
 		}
 		else {
@@ -31,7 +31,7 @@ bool metropolis_accept(float old_f, float new_f, float temperature, float n) {
 __kernel
 void kernel2(
 				const		__global		output_type_cl*			ric,
-							__global		m_cl*					mg,
+							__global const	m_ro_cl* restrict		mg,
 							__constant		pre_cl*					pre,
 							__constant		grids_cl*				grids,
 							__constant		random_maps*			random_maps,
@@ -41,23 +41,22 @@ void kernel2(
 				const						int						torsion_size,
 				const						int						search_depth,
 				const						int						max_bfgs_steps,
-				const 						int						rilc_bfgs_enable
+				const 						int						rilc_bfgs_enable,
+							__global		float*					m_soa_buffer
 ) {
 	int gx = get_global_id(0);
 	int gy = get_global_id(1);
 	int gs = get_global_size(0);
 	int gl = get_global_linear_id();
 
-	float best_e = INFINITY;
-	output_type_cl best_out;
-	ligand_atom_coords_cl best_coords;
-
 	for (int gll = gl;
 			 gll < mis->thread;
 			 gll += mis->total_wi
 		)
 	{
-		m_cl m = *mg;
+		float best_e = INFINITY;
+		output_type_cl best_out;
+
 
 		output_type_cl tmp = ric[gll];
 
@@ -74,11 +73,10 @@ void kernel2(
 							random_maps->int_map,
 							random_maps->sphere_map,
 							random_maps->pi_map,
-							m.ligand.begin,
-							m.ligand.end,
-							m.atoms,
-							&m.m_coords,
-							m.ligand.rigid.origin[0],
+							mg->ligand.begin,
+							mg->ligand.end,
+							mg->atoms,
+							m_soa_buffer, gll, mis->thread,
 							mis->epsilon_fl,
 							mis->mutation_amplitude,
 							torsion_size
@@ -86,7 +84,7 @@ void kernel2(
 			if (rilc_bfgs_enable==1){
 				rilc_bfgs(	&candidate,
 						&g,
-						&m,
+						mg, m_soa_buffer, gll, mis->thread,
 						pre,
 						grids,
 						mis,
@@ -96,7 +94,7 @@ void kernel2(
 			}else{
 				bfgs(	&candidate,
 						&g,
-						&m,
+						mg, m_soa_buffer, gll, mis->thread,
 						pre,
 						grids,
 						mis,
@@ -111,14 +109,14 @@ void kernel2(
 
 				tmp = candidate;
 
-				set(&tmp, &m.ligand.rigid, &m.m_coords,
-					m.atoms, m.m_num_movable_atoms, mis->epsilon_fl);
+				set(&tmp, mg, m_soa_buffer, gll, mis->thread,
+					mis->epsilon_fl);
 
 				if (tmp.e < best_e) {
 					if (rilc_bfgs_enable==1){
 						rilc_bfgs(	&tmp,
 								&g,
-								&m,
+								mg, m_soa_buffer, gll, mis->thread,
 								pre,
 								grids,
 								mis,
@@ -128,7 +126,7 @@ void kernel2(
 					}else{
 						bfgs(	&tmp,
 								&g,
-								&m,
+								mg, m_soa_buffer, gll, mis->thread,
 								pre,
 								grids,
 								mis,
@@ -139,20 +137,24 @@ void kernel2(
 
 					// set
 					if (tmp.e < best_e) {
-						set(&tmp, &m.ligand.rigid, &m.m_coords,
-							m.atoms, m.m_num_movable_atoms, mis->epsilon_fl);
+						set(&tmp, mg, m_soa_buffer, gll, mis->thread,
+							mis->epsilon_fl);
 
 						best_out = tmp;
-						get_heavy_atom_movable_coords(&best_out, &m, &best_coords); // get coords
 						best_e = tmp.e;
 					}
 
+				}
+				
+				if (step == 0 && best_e == INFINITY) {
+					best_out = tmp;
 				}
 			}
 		}
 
 		// write the best conformation back to CPU
 		results[gll] = best_out;
-		coords[gll] = best_coords;
+		set(&best_out, mg, m_soa_buffer, gll, mis->thread, mis->epsilon_fl);
+		get_heavy_atom_movable_coords(&best_out, mg, m_soa_buffer, gll, mis->thread, &coords[gll]);
 	}
 }
