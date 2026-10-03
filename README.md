@@ -92,7 +92,13 @@ The docking box now can be enlarged by
 |Arguments| Description|Limitation
 |--|--|--|
 |--thread| the scale of parallelism (docking lanes)| preferably less than 10000
-|--size_x/y/z|the volume of the searching box |less than 100/100/100 for AutoDock-Vina-GPU 2.1 and 70/70/70 for other two variants
+|--size_x/y/z|the volume of the searching box |AutoDock-Vina-GPU 2.1 sizes its grid buffers to the requested box, so the limit is the device's maximum single allocation (`CL_DEVICE_MAX_MEM_ALLOC_SIZE`, 25 GB on an H100) (the 17 energy grids need about 17 x 32 bytes per 0.375 A grid cell: ~1 GB for a 45 A box, ~10 GB for a 100 A box). 70/70/70 for the other two variants
+
+## Environment variables (AutoDock-Vina-GPU 2.1)
+|Variable| Description|Default
+|--|--|--|
+|VINA_GPU_POST_THREADS| CPU threads used for the post-docking refinement / re-scoring of the ligands (`1` = serial). Results do not depend on it | number of hardware threads
+|VINA_GPU_LOG| file that receives the runtime log when built with `-DTIME_ANALYSIS` | `gpu_runtime.log.<pid>`
 
 ## Citation
 * Tang, Shidi, et al. "Vina-GPU 2.1: towards further optimizing docking speed and precision of AutoDock Vina and its derivatives." IEEE/ACM Transactions on Computational Biology and Bioinformatics (2024).
