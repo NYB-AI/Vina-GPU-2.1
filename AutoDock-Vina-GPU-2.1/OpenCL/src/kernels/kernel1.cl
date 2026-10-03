@@ -54,10 +54,10 @@ const __global int* possibilities(						float*		coords,
 		index[i] = fl_to_sz(tmp, m_data_dims[i] - 1);
 	}
 	int temp = index[0] + m_data_dims[0] * (index[1] + m_data_dims[1] * index[2]);
-	const __global int* address;
-	address = &(ar->relation[temp][0]);
-	*relation_count = ar->relation_size[temp];
-	return address;
+	const __global int* tab = (const __global int*)(ar + 1); // [size[n]][start[n]][indices...]
+	const int n_cells = ar->n_cells;
+	*relation_count = tab[temp];
+	return tab + 2 * n_cells + tab[n_cells + temp];
 }
 
 
@@ -114,6 +114,7 @@ void kernel1(
 		int t = needed[j]; if (t >= nat)printf("\nkernel1: ERROR!2 t = %d,nat=%d",t,nat);
 		int mi = grids->grids[t].m_i;
 		int mj = grids->grids[t].m_j;
+		__global float* gdata = (__global float*)((__global char*)grids + grids->data_base_bytes) + (size_t)grids->grids[t].m_data_cell_offset * 8;
 
 		int addr_base =  x		+ mi * ( y      + mj *  z     );
 		int addr_1	  = (x - 1) + mi * ( y      + mj *  z     );
@@ -124,14 +125,14 @@ void kernel1(
 		int addr_6    =  x      + mi * ((y - 1) + mj * (z - 1));
 		int addr_7    = (x - 1) + mi * ((y - 1) + mj * (z - 1));
 
-								grids->grids[t].m_data[addr_base * 8    ] = affinities[j];
-		if (x != 0)				grids->grids[t].m_data[addr_1    * 8 + 1] = affinities[j];
-		if (y != 0)				grids->grids[t].m_data[addr_2    * 8 + 2] = affinities[j];
-		if (x != 0 && y != 0)	grids->grids[t].m_data[addr_3    * 8 + 3] = affinities[j];
-		if (z != 0)				grids->grids[t].m_data[addr_4    * 8 + 4] = affinities[j];
-		if (x != 0 && z != 0)	grids->grids[t].m_data[addr_5    * 8 + 5] = affinities[j];
-		if (y != 0 && z != 0)	grids->grids[t].m_data[addr_6    * 8 + 6] = affinities[j];
-		if (x * y * z != 0)		grids->grids[t].m_data[addr_7    * 8 + 7] = affinities[j];
+								gdata[addr_base * 8    ] = affinities[j];
+		if (x != 0)				gdata[addr_1    * 8 + 1] = affinities[j];
+		if (y != 0)				gdata[addr_2    * 8 + 2] = affinities[j];
+		if (x != 0 && y != 0)	gdata[addr_3    * 8 + 3] = affinities[j];
+		if (z != 0)				gdata[addr_4    * 8 + 4] = affinities[j];
+		if (x != 0 && z != 0)	gdata[addr_5    * 8 + 5] = affinities[j];
+		if (y != 0 && z != 0)	gdata[addr_6    * 8 + 6] = affinities[j];
+		if (x * y * z != 0)		gdata[addr_7    * 8 + 7] = affinities[j];
 
 	}
 }

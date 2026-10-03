@@ -47,6 +47,7 @@ inline void curl_without_deriv(float* e, float v, const float epsilon_fl) {
 }
 
 float g_evaluate(			__constant	grid_cl*	g,
+					__constant	float*		g_data,				// this grid's values (8 floats per cell)
 					const				float*		m_coords,			// double[3]
 					const				float		slope,				// double
 					const				float		v,					// double
@@ -113,7 +114,7 @@ float g_evaluate(			__constant	grid_cl*	g,
 	//const float f111 = access_m_data(g->m_data, m_i, m_j, x1, y1, z1);
 
 	int base = (x0 + m_i * (y0 + m_j * z0)) * 8;
-	__constant float* base_ptr = &g->m_data[base];
+	__constant float* base_ptr = &g_data[base];
 
 	const float f000 = *base_ptr;
 	const float f100 = *(base_ptr + 1);
@@ -217,7 +218,8 @@ float ig_eval_deriv(						output_type_cl*		x,
 		float m_coords_i[3] = {m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 0, 3, thread_id, total_threads)],
 							   m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 1, 3, thread_id, total_threads)],
 							   m_soa_buffer[SOA_IDX(M_COORDS_OFFSET, i, 2, 3, thread_id, total_threads)]};
-		e = e + g_evaluate(&grids->grids[t], m_coords_i, grids->slope, v, deriv, epsilon_fl);
+		__constant float* g_data = (__constant float*)((__constant char*)grids + grids->data_base_bytes) + (size_t)grids->grids[t].m_data_cell_offset * 8;
+		e = e + g_evaluate(&grids->grids[t], g_data, m_coords_i, grids->slope, v, deriv, epsilon_fl);
 
 		for (int j = 0; j < 3; j++) m_soa_buffer[SOA_IDX(MINUS_FORCES_OFFSET, i, j, 3, thread_id, total_threads)] = deriv[j];
 	}

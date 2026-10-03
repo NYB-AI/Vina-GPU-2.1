@@ -169,12 +169,19 @@ typedef struct {
 	float m_factor[3];
 	float m_dim_fl_minus_1[3];
 	float m_factor_inv[3];
-	float m_data [(MAX_NUM_OF_GRID_MI) * (MAX_NUM_OF_GRID_MJ) * (MAX_NUM_OF_GRID_MK) * 8];
+	// Offset of this grid's values, in 8-float cells, inside the data region that
+	// follows the grids_cl header in the same buffer (see grids_cl.data_base_bytes).
+	// The values used to be a fixed float[MAX_MI*MAX_MJ*MAX_MK*8] member per grid
+	// (864 MB x 17 grids with LARGE_BOX) of which a typical box touches ~6%.
+	int m_data_cell_offset;
 } grid_cl;
 
+// Device layout: [grids_cl header][pad to data_base_bytes][grid 0 values][grid 1 values]...
+// Cell c of a grid holds 8 floats at data + (m_data_cell_offset + c) * 8.
 typedef struct {
 	int atu;
 	float slope;
+	int data_base_bytes;
 	grid_cl grids[GRIDS_SIZE];
 } grids_cl;
 
@@ -197,9 +204,13 @@ typedef struct {
 	float range[3];
 } gb_cl;
 
+// Packed (CSR) atom-relation table, one entry per szv_grid cell. The buffer is
+//   [ar_cl header][int size[n_cells]][int start[n_cells]][int atom indices...]
+// where cell c lists atom indices start[c] .. start[c]+size[c]-1. This replaces a
+// fixed int[38000][38000] (5.8 GB) of which only a few MB were ever used.
 typedef struct {
-	int relation[MAX_NUM_OF_ATOM_RELATION_COUNT][MAX_NUM_OF_ATOM_RELATION_COUNT];
-	int relation_size[MAX_NUM_OF_ATOM_RELATION_COUNT];
+	int n_cells;
+	int pad;
 } ar_cl;
 
 typedef struct {

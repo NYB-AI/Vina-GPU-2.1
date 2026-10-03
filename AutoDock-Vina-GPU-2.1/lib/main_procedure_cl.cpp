@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <algorithm>
+#include <climits>
 
 namespace {
 // Every replica starts from the same state, so each SoA row (one scalar field
@@ -369,27 +370,38 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 	for (int i = 0; i < 3; i++)gb_ptr->range[i] = ig.m_range.data[i];
 	size_t gb_size = sizeof(gb_cl);
 
-	// Preparing atom relationship
-	if(MAX_NUM_OF_ATOM_RELATION_COUNT < ig.m_data.m_data.size()){throw std::runtime_error("Relation too large! Define a large box (see readme) would help");}
+	// Preparing atom relationship: packed (CSR) table, see ar_cl in kernel2.h.
 	// assert(ig.m_data.m_i <= 10); assert(ig.m_data.m_j <= 10); assert(ig.m_data.m_k <= 10);
-	ar_cl* ar_ptr = (ar_cl*)malloc(sizeof(ar_cl));
-	for (int i = 0; i < ig.m_data.m_data.size(); i++) {
-		ar_ptr->relation_size[i] = ig.m_data.m_data[i].size();
-		if(MAX_NUM_OF_ATOM_RELATION_COUNT < ar_ptr->relation_size[i]){throw std::runtime_error("Relation too large! Define a large box (see readme) would help");}
-		for (int j = 0; j < ar_ptr->relation_size[i]; j++) {
-			ar_ptr->relation[i][j] = ig.m_data.m_data[i][j];
+	const size_t ar_cells = ig.m_data.m_data.size();
+	size_t ar_atoms_total = 0;
+	for (size_t i = 0; i < ar_cells; i++) ar_atoms_total += ig.m_data.m_data[i].size();
+	const size_t ar_header_ints = sizeof(ar_cl) / sizeof(int);
+	std::vector<int> ar_host(ar_header_ints + 2 * ar_cells + ar_atoms_total);
+	{
+		ar_cl* ar_hdr = (ar_cl*)ar_host.data();
+		ar_hdr->n_cells = (int)ar_cells;
+		ar_hdr->pad = 0;
+		int* ar_sizes  = ar_host.data() + ar_header_ints;
+		int* ar_starts = ar_sizes + ar_cells;
+		int* ar_atoms  = ar_starts + ar_cells;
+		size_t pos = 0;
+		for (size_t i = 0; i < ar_cells; i++) {
+			ar_sizes[i]  = (int)ig.m_data.m_data[i].size();
+			ar_starts[i] = (int)pos;
+			for (size_t j = 0; j < ig.m_data.m_data[i].size(); j++) ar_atoms[pos++] = (int)ig.m_data.m_data[i][j];
 		}
 	}
-	size_t ar_size = sizeof(ar_cl);
+	size_t ar_size = ar_host.size() * sizeof(int);
 
 	// Preparing grid related data
 	if(GRIDS_SIZE != c.grids.size()){throw std::runtime_error("grid_size has to be 17!");} // grid_size has to be 17
-	grids_cl* grids_ptr = (grids_cl*)malloc(sizeof(grids_cl)); if (grids_ptr == nullptr) {throw std::runtime_error("Grid too large! Define a large box (see readme) would help");}
+	grids_cl* grids_ptr = (grids_cl*)calloc(1, sizeof(grids_cl)); // header only; grid values are computed on the device if (grids_ptr == nullptr) {throw std::runtime_error("Grid too large! Define a large box (see readme) would help");}
 	grid* tmp_grid_ptr = &c.grids[0];
 
 	grids_ptr->atu = c.atu; // atu
 	grids_ptr->slope = c.slope; // slope
 	int grids_front;
+	size_t grid_cells_total = 0;
 	for (int i = GRIDS_SIZE - 1; i >= 0; i--) {
 		for (int j = 0; j < 3; j++) {
 			grids_ptr->grids[i].m_init[j] = tmp_grid_ptr[i].m_init[j];
@@ -398,9 +410,12 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 			grids_ptr->grids[i].m_factor_inv[j] = tmp_grid_ptr[i].m_factor_inv[j];
 		}
 		if (tmp_grid_ptr[i].m_data.dim0() != 0) {
-			grids_ptr->grids[i].m_i = tmp_grid_ptr[i].m_data.dim0(); if(MAX_NUM_OF_GRID_MI < grids_ptr->grids[i].m_i){throw std::runtime_error("MAX_NUM_OF_GRID_MI too small!  Define a large box (see readme) would help");}
-			grids_ptr->grids[i].m_j = tmp_grid_ptr[i].m_data.dim1(); if(MAX_NUM_OF_GRID_MJ < grids_ptr->grids[i].m_j){throw std::runtime_error("MAX_NUM_OF_GRID_MJ too small!  Define a large box (see readme) would help");}
-			grids_ptr->grids[i].m_k = tmp_grid_ptr[i].m_data.dim2(); if(MAX_NUM_OF_GRID_MK < grids_ptr->grids[i].m_k){throw std::runtime_error("MAX_NUM_OF_GRID_MK too small!  Define a large box (see readme) would help");}
+			grids_ptr->grids[i].m_i = tmp_grid_ptr[i].m_data.dim0();
+			grids_ptr->grids[i].m_j = tmp_grid_ptr[i].m_data.dim1();
+			grids_ptr->grids[i].m_k = tmp_grid_ptr[i].m_data.dim2();
+			grids_ptr->grids[i].m_data_cell_offset = (int)grid_cells_total;
+			grid_cells_total += (size_t)grids_ptr->grids[i].m_i * grids_ptr->grids[i].m_j * grids_ptr->grids[i].m_k;
+			if (grid_cells_total >= (size_t)INT_MAX) { throw std::runtime_error("Docking box too large for the grid index!"); }
 			grids_front = i;
 		}
 		else {
@@ -409,7 +424,9 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 			grids_ptr->grids[i].m_k = 0;
 		}
 	}
-	size_t grids_size = sizeof(grids_cl);
+	// Device buffer = header (padded) + 8 floats per grid cell for every grid actually used.
+	grids_ptr->data_base_bytes = (int)((sizeof(grids_cl) + 255) / 256 * 256);
+	size_t grids_size = (size_t)grids_ptr->data_base_bytes + grid_cells_total * 8 * sizeof(float);
 
 	// miscellaneous
 	mis_cl* mis_ptr = (mis_cl*)malloc(sizeof(mis_cl));
@@ -459,11 +476,11 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 
 	cl_mem ar_gpu;
 	CreateDeviceBuffer(&ar_gpu, CL_MEM_READ_ONLY, ar_size, context);
-	err = clEnqueueWriteBuffer(queue, ar_gpu, false, 0, ar_size, ar_ptr, 0, NULL, NULL); checkErr(err);
+	err = clEnqueueWriteBuffer(queue, ar_gpu, false, 0, ar_size, ar_host.data(), 0, NULL, NULL); checkErr(err);
 
 	cl_mem grids_gpu;
 	CreateDeviceBuffer(&grids_gpu, CL_MEM_READ_WRITE, grids_size, context);
-	err = clEnqueueWriteBuffer(queue, grids_gpu, false, 0, grids_size, grids_ptr, 0, NULL, NULL); checkErr(err);
+	err = clEnqueueWriteBuffer(queue, grids_gpu, false, 0, sizeof(grids_cl), grids_ptr, 0, NULL, NULL); checkErr(err); // values are written by kernel1
 
 	cl_mem needed_gpu;
 	CreateDeviceBuffer(&needed_gpu, CL_MEM_READ_WRITE, mis_ptr->needed_size * sizeof(float), context);
@@ -505,7 +522,6 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 
 	free(pa_ptr);
 	free(gb_ptr);
-	free(ar_ptr);
 	free(needed_ptr);
 	free(pre_ptr);
 	free(grids_ptr);
