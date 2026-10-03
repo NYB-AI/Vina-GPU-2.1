@@ -482,8 +482,14 @@ void main_procedure_cl(cache& c, const std::vector<model>& ms,  const precalcula
 # endif
 
 	cl_event kernel1;
-	size_t kernel1_global_size[3] = { 128, 128, 128 };
+	// Cover every grid point. A fixed 128^3 launch silently left the grid
+	// layers beyond 128 points (boxes wider than ~47.6 A at 0.375 A spacing)
+	// uncomputed, i.e. zero energy. kernel1 returns early for x/y/z >= m_i/m_j/m_k.
 	size_t kernel1_local_size[3] = { 4,4,4 };
+	size_t kernel1_global_size[3] = {
+		((size_t)grids_ptr->grids[grids_front].m_i + kernel1_local_size[0] - 1) / kernel1_local_size[0] * kernel1_local_size[0],
+		((size_t)grids_ptr->grids[grids_front].m_j + kernel1_local_size[1] - 1) / kernel1_local_size[1] * kernel1_local_size[1],
+		((size_t)grids_ptr->grids[grids_front].m_k + kernel1_local_size[2] - 1) / kernel1_local_size[2] * kernel1_local_size[2] };
 
 	err = clEnqueueNDRangeKernel(queue, kernels[0], 3, 0, kernel1_global_size, kernel1_local_size, 0, NULL, &kernel1); checkErr(err);
 	clWaitForEvents(1, &kernel1);
