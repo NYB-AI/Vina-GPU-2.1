@@ -27,6 +27,8 @@
 #include <cmath> // for ceila
 #include <cstdlib> // getenv for VINA_GPU_LOG
 #include <unistd.h> // getpid for per-process log
+#include <thread>
+#include <atomic>
 #include <boost/program_options.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/exception.hpp>
@@ -358,35 +360,72 @@ void main_procedure(std::vector<model>& ms, const boost::optional<model>& ref, /
 	const scoring_function& sf = wt;
 	std::cout << std::endl;
 
+	// Refinement, re-scoring and clustering are independent per ligand and
+	// deterministic (no RNG), but used to run one ligand after another on a single
+	// CPU thread once all docking had finished. Do the compute in a thread pool
+	// (VINA_GPU_POST_THREADS overrides the thread count; 1 = serial) and keep
+	// printing/writing sequential below so console output and files are unchanged.
+	std::vector<model> post_models(ms.begin(), ms.end());
+	std::vector<char> post_failed(ligand_num, 0);
+	std::vector<std::string> post_error(ligand_num);
+	{
+		auto post_process = [&](int ligand_count) {
+			output_container& out_cont = out_conts[ligand_count];
+			model& m = post_models[ligand_count];
+#ifndef NO_REFINEMENT
+			VINA_FOR_IN(i, out_cont)
+				refine_structure(m, prec, nc[ligand_count], out_cont[i], authentic_v, par.mc.ssd_par.bfgs_steps[ligand_count]);
+#endif
+			if (!out_cont.empty()) {
+				out_cont.sort();
+				const fl best_mode_intramolecular_energy = m.eval_intramolecular(prec, authentic_v, out_cont[0].c);
+				VINA_FOR_IN(i, out_cont)
+					if (not_max(out_cont[i].e))
+						out_cont[i].e = m.eval_adjusted(sf, prec, nc[ligand_count], authentic_v, out_cont[i].c, best_mode_intramolecular_energy);
+				// the order must not change because of non-decreasing g (see paper), but we'll re-sort in case g is non strictly increasing
+				out_cont.sort();
+				const fl out_min_rmsd = 1;
+				out_cont = remove_redundant(out_cont, out_min_rmsd);
+			}
+		};
+
+		unsigned nthreads = std::thread::hardware_concurrency();
+		if (const char* env = std::getenv("VINA_GPU_POST_THREADS")) {
+			const int v = std::atoi(env);
+			if (v >= 1) nthreads = (unsigned)v;
+		}
+		nthreads = std::max(1u, std::min<unsigned>(nthreads, (unsigned)ligand_num));
+
+		std::atomic<int> next_ligand(0);
+		auto worker = [&]() {
+			for (int i; (i = next_ligand++) < ligand_num; ) {
+				try { post_process(i); }
+				catch (const std::exception& e) { post_failed[i] = 1; post_error[i] = e.what(); }
+			}
+		};
+		std::vector<std::thread> pool;
+		for (unsigned t = 1; t < nthreads; t++) pool.emplace_back(worker);
+		worker();
+		for (std::thread& th : pool) th.join();
+	}
+
 	for (int ligand_count = 0; ligand_count < ligand_num; ligand_count++) {
 
-		output_container out_cont = out_conts[ligand_count];
-		model m = ms[ligand_count];
+		output_container& out_cont = out_conts[ligand_count];
+		model& m = post_models[ligand_count];
 
 		std::string name_tmp = out_names[ligand_count];
 		//int int1 = name_tmp.find("\\"); int int2 = name_tmp.find(".pdbqt");
 		std::string name_tmp2 = name_tmp.substr(name_tmp.find("\\")+1, name_tmp.length() - name_tmp.find("\\") -11);
 		std::cout << "Refining ligand " << name_tmp2 << " results...";
-#ifndef NO_REFINEMENT
-		VINA_FOR_IN(i, out_cont)
-			refine_structure(m, prec, nc[ligand_count], out_cont[i], authentic_v, par.mc.ssd_par.bfgs_steps[ligand_count]);
-#endif
-		if (!out_cont.empty()) {
-			out_cont.sort();
-			const fl best_mode_intramolecular_energy = m.eval_intramolecular(prec, authentic_v, out_cont[0].c);
-			VINA_FOR_IN(i, out_cont)
-				if (not_max(out_cont[i].e))
-					out_cont[i].e = m.eval_adjusted(sf, prec, nc[ligand_count], authentic_v, out_cont[i].c, best_mode_intramolecular_energy);
-			// the order must not change because of non-decreasing g (see paper), but we'll re-sort in case g is non strictly increasing
-			out_cont.sort();
+		if (post_failed[ligand_count]) {
+			std::cerr << std::endl << "Error post-processing ligand " << name_tmp2 << ": " << post_error[ligand_count] << std::endl << std::endl;
+			continue;
 		}
-		else{
+		if (out_cont.empty()) {
 			std::cout << std::endl << "No results found for ligand " << name_tmp2 << std::endl << std::endl;
 			continue;
 		}
-
-		const fl out_min_rmsd = 1;
-		out_cont = remove_redundant(out_cont, out_min_rmsd);
 
 		done(verbosity, log);
 
